@@ -1367,6 +1367,75 @@ def create_at_bat_pdf(df, output_path):
 
 
 # =============================================================================
+# HELPER: Get common cloud sync folder paths
+# =============================================================================
+def get_common_sync_paths():
+    """Get list of common cloud sync folder paths that might exist on this system."""
+    import platform
+    home = Path.home()
+    paths = []
+
+    if platform.system() == "Darwin":  # macOS
+        # Google Drive
+        gdrive_path = home / "Library" / "CloudStorage"
+        if gdrive_path.exists():
+            for folder in gdrive_path.iterdir():
+                if folder.name.startswith("GoogleDrive"):
+                    paths.append(("Google Drive", str(folder / "My Drive")))
+
+        # Dropbox
+        dropbox_path = home / "Dropbox"
+        if dropbox_path.exists():
+            paths.append(("Dropbox", str(dropbox_path)))
+
+        # OneDrive
+        onedrive_path = home / "Library" / "CloudStorage"
+        if onedrive_path.exists():
+            for folder in onedrive_path.iterdir():
+                if "OneDrive" in folder.name:
+                    paths.append(("OneDrive", str(folder)))
+
+        # iCloud
+        icloud_path = home / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
+        if icloud_path.exists():
+            paths.append(("iCloud Drive", str(icloud_path)))
+
+    elif platform.system() == "Windows":
+        # Google Drive
+        for drive_letter in ["G", "H", "I"]:
+            gdrive_path = Path(f"{drive_letter}:/My Drive")
+            if gdrive_path.exists():
+                paths.append(("Google Drive", str(gdrive_path)))
+
+        gdrive_path2 = home / "Google Drive"
+        if gdrive_path2.exists():
+            paths.append(("Google Drive", str(gdrive_path2)))
+
+        # Dropbox
+        dropbox_path = home / "Dropbox"
+        if dropbox_path.exists():
+            paths.append(("Dropbox", str(dropbox_path)))
+
+        # OneDrive
+        onedrive_path = home / "OneDrive"
+        if onedrive_path.exists():
+            paths.append(("OneDrive", str(onedrive_path)))
+
+    else:  # Linux
+        # Google Drive (via google-drive-ocamlfuse or similar)
+        gdrive_path = home / "google-drive"
+        if gdrive_path.exists():
+            paths.append(("Google Drive", str(gdrive_path)))
+
+        # Dropbox
+        dropbox_path = home / "Dropbox"
+        if dropbox_path.exists():
+            paths.append(("Dropbox", str(dropbox_path)))
+
+    return paths
+
+
+# =============================================================================
 # MAIN APP
 # =============================================================================
 def main():
@@ -1383,6 +1452,9 @@ def main():
 
     df = None
 
+    # =========================================================================
+    # UPLOAD FILES
+    # =========================================================================
     if data_source == "Upload Files":
         uploaded_files = st.sidebar.file_uploader(
             "Upload CSV files",
@@ -1393,17 +1465,92 @@ def main():
         if uploaded_files:
             df = load_csv_files(uploaded_files)
 
-    else:  # Load from Folder
-        folder_path = st.sidebar.text_input(
-            "Folder Path",
-            placeholder="/path/to/your/csv/folder"
-        )
+    # =========================================================================
+    # LOAD FROM LOCAL FOLDER (includes cloud sync folders)
+    # =========================================================================
+    elif data_source == "Load from Folder":
+
+        # Check for common cloud sync folders
+        sync_paths = get_common_sync_paths()
+
+        if sync_paths:
+            st.sidebar.markdown("**☁️ Detected Cloud Folders:**")
+            selected_sync = st.sidebar.selectbox(
+                "Quick select:",
+                ["Custom path..."] + [f"{name}: {path}" for name, path in sync_paths],
+                key="sync_folder_select"
+            )
+
+            if selected_sync != "Custom path...":
+                # Extract path from selection
+                folder_path = selected_sync.split(": ", 1)[1]
+            else:
+                folder_path = st.sidebar.text_input(
+                    "Folder Path",
+                    placeholder="/path/to/your/csv/folder",
+                    key="custom_folder_path"
+                )
+        else:
+            folder_path = st.sidebar.text_input(
+                "Folder Path",
+                placeholder="/path/to/your/csv/folder",
+                key="folder_path_input"
+            )
+
+            # Show helpful tips
+            with st.sidebar.expander("💡 Tips: Finding your folder"):
+                st.markdown("""
+                **Google Drive Desktop:**
+                - Mac: `~/Library/CloudStorage/GoogleDrive-.../My Drive`
+                - Windows: `G:\\My Drive` or `C:\\Users\\You\\Google Drive`
+                
+                **Dropbox:**
+                - Mac/Windows: `~/Dropbox` or `C:\\Users\\You\\Dropbox`
+                
+                **OneDrive:**
+                - Mac: `~/Library/CloudStorage/OneDrive-...`
+                - Windows: `C:\\Users\\You\\OneDrive`
+                
+                **External Drive:**
+                - Mac: `/Volumes/YourDriveName/folder`
+                - Windows: `D:\\folder` or `E:\\folder`
+                """)
 
         if folder_path:
+            # Expand ~ to home directory
+            folder_path = os.path.expanduser(folder_path)
+
+            # Check if folder exists
+            if os.path.exists(folder_path):
+                st.sidebar.success(f"✅ Folder found")
+
+                # Try to count CSV files
+                csv_count = len([f for f in glob.glob(os.path.join(folder_path, '*.csv'))
+                                if 'playerpositioning' not in f.lower()])
+                st.sidebar.caption(f"📄 {csv_count} CSV files found")
+            else:
+                st.sidebar.error(f"❌ Folder not found")
+
+            # Subfolder navigation
+            if os.path.exists(folder_path):
+                subfolders = [f.name for f in Path(folder_path).iterdir() if f.is_dir()]
+                if subfolders:
+                    subfolder = st.sidebar.selectbox(
+                        "📂 Subfolder (optional):",
+                        ["(root folder)"] + sorted(subfolders),
+                        key="subfolder_select"
+                    )
+                    if subfolder != "(root folder)":
+                        folder_path = os.path.join(folder_path, subfolder)
+                        csv_count = len([f for f in glob.glob(os.path.join(folder_path, '*.csv'))
+                                        if 'playerpositioning' not in f.lower()])
+                        st.sidebar.caption(f"📄 {csv_count} CSV files in subfolder")
+
             # Date range selector
+            st.sidebar.markdown("---")
             st.sidebar.subheader("📅 Date Range")
 
-            use_date_filter = st.sidebar.checkbox("Filter by date range")
+            use_date_filter = st.sidebar.checkbox("Filter by date range", key="folder_date_filter")
 
             start_date = None
             end_date = None
@@ -1411,25 +1558,39 @@ def main():
             if use_date_filter:
                 col1, col2 = st.sidebar.columns(2)
                 with col1:
-                    start_date = st.date_input("Start Date", value=datetime.now() - timedelta(days=30))
+                    start_date = st.date_input("Start Date", value=datetime.now() - timedelta(days=30), key="folder_start")
                     start_date = datetime.combine(start_date, datetime.min.time())
                 with col2:
-                    end_date = st.date_input("End Date", value=datetime.now())
+                    end_date = st.date_input("End Date", value=datetime.now(), key="folder_end")
                     end_date = datetime.combine(end_date, datetime.max.time())
 
-            if st.sidebar.button("Load Data"):
+            if st.sidebar.button("📥 Load Data", key="folder_load", type="primary"):
                 with st.spinner("Loading data..."):
                     df = load_csv_from_folder(folder_path, start_date, end_date)
                     if df is not None:
                         st.session_state['df'] = df
-                        st.success(f"Loaded {len(df)} rows from folder")
+                        st.session_state['data_source'] = 'folder'
+                        st.session_state['folder_path'] = folder_path
 
-            # Check if data was previously loaded
-            if 'df' in st.session_state:
+                        # Count loaded files
+                        if '_source_file' in df.columns:
+                            file_count = df['_source_file'].nunique()
+                            st.success(f"✅ Loaded {len(df)} rows from {file_count} files")
+                        else:
+                            st.success(f"✅ Loaded {len(df)} rows")
+                    else:
+                        st.error("No CSV files found matching your criteria")
+
+            # Show currently loaded data info
+            if 'df' in st.session_state and st.session_state.get('data_source') == 'folder':
                 df = st.session_state['df']
+                if '_source_file' in df.columns:
+                    with st.sidebar.expander(f"📄 Loaded Files ({df['_source_file'].nunique()})"):
+                        for f in sorted(df['_source_file'].unique()):
+                            st.caption(f"• {f}")
 
     if df is None:
-        st.info("👈 Please upload CSV files or specify a folder path in the sidebar to get started.")
+        st.info("👈 Please select a data source in the sidebar to get started.")
 
         st.markdown("""
         ### Welcome to the Baseball Analytics Dashboard!
@@ -1443,11 +1604,46 @@ def main():
         - **📊 Pitcher Scrimmage Report** - Individual pitcher analysis
         - **📄 At-Bat Sequences** - PDF export of pitch sequences
         
-        ### Data Loading Options:
+        ---
         
-        **Upload Files**: Upload individual CSV files directly
+        ### 📁 Data Loading Options
         
-        **Load from Folder**: Point to a folder containing your CSV files. Files should be named with dates in YYYYMMDD format (e.g., `20251003_game.csv`). You can filter by date range.
+        **📤 Upload Files**  
+        Drag and drop CSV files directly into the uploader.
+        
+        **📂 Load from Folder**  
+        Point to any folder on your computer, including:
+        - **Google Drive** (via Google Drive Desktop app)
+        - **Dropbox** (synced folder)
+        - **OneDrive** (synced folder)
+        - **External hard drive**
+        - **Any local folder**
+        
+        ---
+        
+        ### ☁️ Using Google Drive (No API Required!)
+        
+        1. Install [Google Drive for Desktop](https://www.google.com/drive/download/)
+        2. Sign in with your Google account
+        3. Your Drive files will sync to a local folder
+        4. In this dashboard, select **"Load from Folder"**
+        5. The app will auto-detect your Google Drive folder!
+        
+        **Common Google Drive paths:**
+        - **Mac**: `~/Library/CloudStorage/GoogleDrive-you@email.com/My Drive/`
+        - **Windows**: `G:\\My Drive\\` or `C:\\Users\\You\\Google Drive\\`
+        
+        ---
+        
+        ### 📅 Date Filtering
+        
+        Name your CSV files with the date at the start (YYYYMMDD format):
+        ```
+        20251003_game_data.csv
+        20251015_practice.csv
+        ```
+        
+        Then use the date filter to load only files within a specific range!
         """)
         return
 
