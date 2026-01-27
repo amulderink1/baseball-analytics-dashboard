@@ -1,9 +1,9 @@
 """
-⚾ Baseball Analytics Dashboard
+⚾ Baseball Analytics Dashboard v2.0
 Unified interface for all baseball analytics reports
 
 Reports included:
-- Pitcher Graphic (RHH/LHH splits, catcher view)
+- Pitcher Trajectory Report (RHH/LHH splits, side view + catcher view with KDE zones)
 - At-Bat Pitch Sequences (PDF)
 - Team Offense Overview (spray chart)
 - Hard-Hit Balls Report (CSV)
@@ -18,14 +18,18 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from matplotlib.patches import Rectangle, Polygon, Wedge, Arc
+from matplotlib.patches import Rectangle, Polygon, Wedge, Arc, Ellipse
 from matplotlib.backends.backend_pdf import PdfPages
+from scipy.spatial import ConvexHull
+from scipy import stats
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import tempfile
 import os
 import io
 import warnings
+import glob
+import re
 
 warnings.filterwarnings('ignore')
 
@@ -48,7 +52,7 @@ PITCH_COLORS = {
     'Sinker': '#9b59b6',
     'Changeup': '#2ecc71',
     'ChangeUp': '#2ecc71',
-    'Splitter': '#e67e22',
+    'Splitter': '#2ecc71',
     'Curveball': '#3498db',
     'Slider': '#f1c40f',
     'Cutter': '#FF8C00',
@@ -59,14 +63,87 @@ PITCH_COLORS = {
 MOUND_DISTANCE = 60.5
 PLATE_Y = 1.417
 PLATE_WIDTH = 17 / 12
+STRIKE_ZONE_WIDTH = PLATE_WIDTH
 STRIKE_ZONE_HEIGHT_LOW = 1.5
 STRIKE_ZONE_HEIGHT_HIGH = 3.5
 GRAVITY = 32.174
 
+# UMBA Physics Model Constants
+RHO_AIR = 0.074
+BALL_DIAMETER = (2 + 15 / 16) / 12
+BALL_AREA = 0.25 * np.pi * BALL_DIAMETER ** 2
+BALL_MASS = 5.125 / 16
+C0_AERO = 0.5 * RHO_AIR * BALL_AREA / BALL_MASS
+CD_CONSTANT = 0.33
+
 
 # =============================================================================
-# DATA LOADING
+# DATA LOADING - WITH GOOGLE DRIVE FOLDER SUPPORT
 # =============================================================================
+def get_date_from_filename(filename):
+    """Extract date from filename in YYYYMMDD format"""
+    match = re.match(r'(\d{8})', os.path.basename(filename))
+    if match:
+        try:
+            return datetime.strptime(match.group(1), '%Y%m%d')
+        except:
+            return None
+    return None
+
+
+def load_csv_from_folder(folder_path, start_date=None, end_date=None):
+    """Load CSV files from a folder, optionally filtered by date range"""
+    all_data = []
+
+    if not os.path.exists(folder_path):
+        st.error(f"Folder not found: {folder_path}")
+        return None
+
+    csv_files = glob.glob(os.path.join(folder_path, '*.csv'))
+
+    for csv_file in csv_files:
+        # Skip player positioning files
+        if 'playerpositioning' in csv_file.lower():
+            continue
+
+        # Filter by date if specified
+        file_date = get_date_from_filename(csv_file)
+        if file_date:
+            if start_date and file_date < start_date:
+                continue
+            if end_date and file_date > end_date:
+                continue
+
+        try:
+            df = pd.read_csv(csv_file)
+            df.columns = df.columns.str.strip()
+            df['_source_file'] = os.path.basename(csv_file)
+            all_data.append(df)
+        except Exception as e:
+            st.warning(f"Error loading {os.path.basename(csv_file)}: {e}")
+
+    if not all_data:
+        return None
+
+    combined_df = pd.concat(all_data, ignore_index=True)
+
+    # Standardize pitch types
+    pitch_map = {
+        'Four-Seam': 'Fastball',
+        'FourSeamFastBall': 'Fastball',
+        'Four-Seam Fastball': 'Fastball',
+        'Two-Seam': 'Sinker',
+        'TwoSeamFastBall': 'Sinker',
+        'Two-Seam Fastball': 'Sinker',
+        'ChangeUp': 'Changeup',
+        'Change Up': 'Changeup'
+    }
+    if 'TaggedPitchType' in combined_df.columns:
+        combined_df['TaggedPitchType'] = combined_df['TaggedPitchType'].replace(pitch_map)
+
+    return combined_df
+
+
 @st.cache_data
 def load_csv_files(uploaded_files):
     """Load and combine uploaded CSV files"""
@@ -78,6 +155,7 @@ def load_csv_files(uploaded_files):
             df.columns = df.columns.str.strip()
             # Skip player positioning files
             if 'playerpositioning' not in uploaded_file.name.lower():
+                df['_source_file'] = uploaded_file.name
                 all_data.append(df)
         except Exception as e:
             st.warning(f"Error loading {uploaded_file.name}: {e}")
@@ -123,10 +201,10 @@ def get_pitch_color(pitch_type):
 
 
 # =============================================================================
-# HITTING REPORTS - From hitting_overview.py
+# HITTING REPORTS - FIXED VERSION
 # =============================================================================
 def filter_quality_bip(df, team=None, min_ev=90, exclude_team='WES_VAL'):
-    """Filter for quality balls in play"""
+    """Filter for quality balls in play - FIXED VERSION"""
     mask = (
         (df['ExitSpeed'].notna()) &
         (df['ExitSpeed'] >= min_ev) &
@@ -143,30 +221,57 @@ def filter_quality_bip(df, team=None, min_ev=90, exclude_team='WES_VAL'):
 
     bip = df[mask].copy()
 
+    # Create EVCategory with fixed labels that match the color dictionary
+    # Always use standard labels regardless of min_ev threshold
     bip['EVCategory'] = pd.cut(
         bip['ExitSpeed'],
         bins=[min_ev, 95, 100, float('inf')],
-        labels=[f'{min_ev}-95', '95-100', '100+'],
+        labels=['Low', 'Mid', 'High'],  # Use generic labels
         right=False
+    )
+
+    # Create display labels that include actual ranges
+    bip['EVDisplay'] = bip['ExitSpeed'].apply(
+        lambda x: f'{min_ev}-95' if x < 95 else ('95-100' if x < 100 else '100+')
     )
 
     return bip
 
 
-def get_hit_color(hit_type, ev_category):
-    """Get color based on hit type and EV category"""
+def get_hit_color(hit_type, exit_speed, min_ev=90):
+    """Get color based on hit type and exit speed - FIXED VERSION"""
     colors = {
         'GroundBall': {
-            '90-95': '#93C5FD', '95-100': '#3B82F6', '100+': '#1E40AF'
+            'Low': '#93C5FD',    # Light blue
+            'Mid': '#3B82F6',    # Medium blue
+            'High': '#1E40AF'    # Dark blue
         },
         'LineDrive': {
-            '90-95': '#86EFAC', '95-100': '#22C55E', '100+': '#15803D'
+            'Low': '#86EFAC',    # Light green
+            'Mid': '#22C55E',    # Medium green
+            'High': '#15803D'    # Dark green
         },
         'FlyBall': {
-            '90-95': '#FCD34D', '95-100': '#F97316', '100+': '#DC2626'
+            'Low': '#FCD34D',    # Light orange/yellow
+            'Mid': '#F97316',    # Medium orange
+            'High': '#DC2626'    # Red
+        },
+        'Popup': {
+            'Low': '#E5E7EB',    # Light gray
+            'Mid': '#9CA3AF',    # Medium gray
+            'High': '#4B5563'    # Dark gray
         }
     }
-    return colors.get(hit_type, {}).get(str(ev_category), '#9CA3AF')
+
+    # Determine EV category based on speed
+    if exit_speed < 95:
+        ev_cat = 'Low'
+    elif exit_speed < 100:
+        ev_cat = 'Mid'
+    else:
+        ev_cat = 'High'
+
+    return colors.get(hit_type, colors.get('FlyBall', {})).get(ev_cat, '#9CA3AF')
 
 
 def convert_to_field_coords(bearing, distance):
@@ -206,8 +311,8 @@ def draw_field(ax):
     ax.text(0.5, 1.02, 'HOME', ha='center', va='bottom', fontsize=10, fontweight='bold')
 
 
-def create_team_spray_chart(bip_df, title="Team Offense Overview"):
-    """Create team spray chart visualization - from hitting_overview.py"""
+def create_team_spray_chart(bip_df, title="Team Offense Overview", min_ev=90):
+    """Create team spray chart visualization - FIXED VERSION"""
     fig = plt.figure(figsize=(14, 12))
 
     dates = bip_df['Date'].unique() if 'Date' in bip_df.columns else []
@@ -218,9 +323,10 @@ def create_team_spray_chart(bip_df, title="Team Offense Overview"):
     ld_count = len(bip_df[bip_df['TaggedHitType'] == 'LineDrive'])
     fb_count = len(bip_df[bip_df['TaggedHitType'] == 'FlyBall'])
 
-    ev90_count = len(bip_df[bip_df['EVCategory'] == '90-95']) if 'EVCategory' in bip_df.columns else 0
-    ev95_count = len(bip_df[bip_df['EVCategory'] == '95-100']) if 'EVCategory' in bip_df.columns else 0
-    ev100_count = len(bip_df[bip_df['EVCategory'] == '100+']) if 'EVCategory' in bip_df.columns else 0
+    # Count by actual exit speed ranges - FIXED
+    ev_low_count = len(bip_df[(bip_df['ExitSpeed'] >= min_ev) & (bip_df['ExitSpeed'] < 95)])
+    ev_mid_count = len(bip_df[(bip_df['ExitSpeed'] >= 95) & (bip_df['ExitSpeed'] < 100)])
+    ev_high_count = len(bip_df[bip_df['ExitSpeed'] >= 100])
 
     fig.suptitle(title, fontsize=24, fontweight='bold', y=0.96)
     if date_str:
@@ -240,28 +346,30 @@ def create_team_spray_chart(bip_df, title="Team Offense Overview"):
         if pd.isna(bearing) or pd.isna(distance):
             continue
         x, y = convert_to_field_coords(bearing, distance)
-        color = get_hit_color(hit['TaggedHitType'], hit.get('EVCategory', '90-95'))
+
+        # Use the fixed color function with actual exit speed
+        color = get_hit_color(hit['TaggedHitType'], hit['ExitSpeed'], min_ev)
 
         ax_spray.plot(x, y, 'o', color=color, markersize=16,
                       markeredgecolor='white', markeredgewidth=2.5, alpha=0.85)
         ax_spray.text(x, y - 0.02, f"{hit['ExitSpeed']:.1f}",
                       ha='center', va='top', fontsize=9, fontweight='bold')
 
-    # Stats box
+    # Stats box - FIXED to use actual counts
     stats_text = f'Total: {total} | GB: {gb_count} | LD: {ld_count} | FB: {fb_count}\n'
-    stats_text += f'90-95: {ev90_count} | 95-100: {ev95_count} | 100+: {ev100_count}'
+    stats_text += f'{min_ev}-95: {ev_low_count} | 95-100: {ev_mid_count} | 100+: {ev_high_count}'
     ax_spray.text(0.98, 0.98, stats_text, transform=ax_spray.transAxes,
                   ha='right', va='top', fontsize=12,
                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
 
-    # Legend
+    # Legend - Updated with dynamic first range label
     ax_legend = fig.add_axes([0.1, 0.08, 0.8, 0.14])
     ax_legend.axis('off')
 
     legend_data = [
-        ('Ground Ball', ['90-95', '95-100', '100+'], ['#93C5FD', '#3B82F6', '#1E40AF'], 0.05),
-        ('Line Drive', ['90-95', '95-100', '100+'], ['#86EFAC', '#22C55E', '#15803D'], 0.38),
-        ('Fly Ball', ['90-95', '95-100', '100+'], ['#FCD34D', '#F97316', '#DC2626'], 0.71),
+        ('Ground Ball', [f'{min_ev}-95', '95-100', '100+'], ['#93C5FD', '#3B82F6', '#1E40AF'], 0.05),
+        ('Line Drive', [f'{min_ev}-95', '95-100', '100+'], ['#86EFAC', '#22C55E', '#15803D'], 0.38),
+        ('Fly Ball', [f'{min_ev}-95', '95-100', '100+'], ['#FCD34D', '#F97316', '#DC2626'], 0.71),
     ]
 
     for hit_type, labels, colors, x_start in legend_data:
@@ -277,7 +385,7 @@ def create_team_spray_chart(bip_df, title="Team Offense Overview"):
     # Summary at bottom
     ax_summary = fig.add_axes([0.1, 0.01, 0.8, 0.04])
     ax_summary.axis('off')
-    summary_text = f'Total Quality BIP: {total}  |  90-95 mph: {ev90_count}  |  95-100 mph: {ev95_count}  |  100+ mph: {ev100_count}'
+    summary_text = f'Total Quality BIP: {total}  |  {min_ev}-95 mph: {ev_low_count}  |  95-100 mph: {ev_mid_count}  |  100+ mph: {ev_high_count}'
     ax_summary.text(0.5, 0.5, summary_text, ha='center', va='center',
                     fontsize=13, fontweight='bold',
                     bbox=dict(boxstyle='round', facecolor='#f3f4f6', alpha=0.8))
@@ -287,7 +395,7 @@ def create_team_spray_chart(bip_df, title="Team Offense Overview"):
 
 
 def create_hard_hit_csv(df, team=None, min_ev=90):
-    """Generate hard-hit balls CSV data - from hitting_overview.py"""
+    """Generate hard-hit balls CSV data"""
     bip_df = filter_quality_bip(df, team=team, min_ev=min_ev)
 
     if len(bip_df) == 0:
@@ -298,7 +406,7 @@ def create_hard_hit_csv(df, team=None, min_ev=90):
 
     # Select columns
     export_cols = ['Batter', 'TaggedHitType', 'ExitSpeed', 'Angle', 'Distance',
-                   'PlayResult', 'EVCategory', 'Date', 'Direction', 'Bearing']
+                   'PlayResult', 'EVDisplay', 'Date', 'Direction', 'Bearing']
     available_cols = [c for c in export_cols if c in export_df.columns]
 
     export_df = export_df[available_cols].copy()
@@ -311,7 +419,7 @@ def create_hard_hit_csv(df, team=None, min_ev=90):
         'Angle': 'Launch_Angle',
         'Distance': 'Distance_ft',
         'PlayResult': 'Result',
-        'EVCategory': 'EV_Range'
+        'EVDisplay': 'EV_Range'
     }
     export_df = export_df.rename(columns={k: v for k, v in rename_map.items() if k in export_df.columns})
 
@@ -319,7 +427,580 @@ def create_hard_hit_csv(df, team=None, min_ev=90):
 
 
 # =============================================================================
-# PITCHER GRAPHIC - From change.py (RHH/LHH splits, catcher view)
+# TRAJECTORY CALCULATION - From pitch_count.py
+# =============================================================================
+def trajectory_9p_quadratic(pitch_data, num_points=50):
+    """Calculate trajectory using the 9-parameter quadratic model."""
+    x0 = pitch_data['x0']
+    y0 = pitch_data['y0'] if 'y0' in pitch_data and pd.notna(pitch_data.get('y0')) else 50.0
+    z0 = pitch_data['z0']
+    vx0 = pitch_data['vx0']
+    vy0 = pitch_data['vy0']
+    vz0 = pitch_data['vz0']
+    ax = pitch_data['ax0']
+    ay = pitch_data['ay0']
+    az = pitch_data['az0']
+
+    if any(pd.isna(v) for v in [x0, z0, vx0, vy0, vz0, ax, ay, az]):
+        return None, None, None
+
+    a_coef = 0.5 * ay
+    b_coef = vy0
+    c_coef = y0 - PLATE_Y
+
+    discriminant = b_coef ** 2 - 4 * a_coef * c_coef
+    if discriminant < 0:
+        return None, None, None
+
+    t_flight = (-b_coef - np.sqrt(discriminant)) / (2 * a_coef)
+    if t_flight <= 0:
+        t_flight = (-b_coef + np.sqrt(discriminant)) / (2 * a_coef)
+
+    if t_flight <= 0 or t_flight > 1.2:
+        return None, None, None
+
+    t = np.linspace(0, t_flight, num_points)
+
+    x = x0 + vx0 * t + 0.5 * ax * t ** 2
+    y = y0 + vy0 * t + 0.5 * ay * t ** 2
+    z = z0 + vz0 * t + 0.5 * az * t ** 2
+
+    return x, y, z
+
+
+def trajectory_ode_physics(pitch_data, num_points=50, dt=0.001):
+    """Calculate trajectory using full ODE integration with UMBA physics model."""
+    x0 = pitch_data['x0']
+    y0 = pitch_data['y0'] if 'y0' in pitch_data and pd.notna(pitch_data.get('y0')) else 50.0
+    z0 = pitch_data['z0']
+    vx0 = pitch_data['vx0']
+    vy0 = pitch_data['vy0']
+    vz0 = pitch_data['vz0']
+
+    spin_rate = pitch_data.get('SpinRate', np.nan)
+    spin_axis = pitch_data.get('SpinAxis', np.nan)
+
+    if any(pd.isna(v) for v in [x0, z0, vx0, vy0, vz0]):
+        return None, None, None
+
+    if pd.isna(spin_rate) or pd.isna(spin_axis) or spin_rate < 100:
+        return trajectory_9p_quadratic(pitch_data, num_points)
+
+    omega_total = spin_rate * 0.104719754
+    spin_axis_rad = np.radians(spin_axis)
+    omega_x = -omega_total * np.cos(spin_axis_rad)
+    omega_y = 0
+    omega_z = omega_total * np.sin(spin_axis_rad)
+    r = BALL_DIAMETER / 2
+
+    def derivatives(state):
+        x, y, z, vx, vy, vz = state
+        v_mag = np.sqrt(vx ** 2 + vy ** 2 + vz ** 2)
+        if v_mag < 1e-6:
+            return np.array([vx, vy, vz, 0, 0, -GRAVITY])
+
+        omega_mag = np.sqrt(omega_x ** 2 + omega_y ** 2 + omega_z ** 2)
+        if omega_mag < 1e-6:
+            omega_mag = 1e-6
+
+        S = (r * omega_mag) / v_mag
+        Cl = 1.0 / (2.32 + 0.4 / S) if S > 0.01 else 0
+
+        ax_drag = -C0_AERO * CD_CONSTANT * v_mag * vx
+        ay_drag = -C0_AERO * CD_CONSTANT * v_mag * vy
+        az_drag = -C0_AERO * CD_CONSTANT * v_mag * vz
+
+        cross_x = omega_y * vz - omega_z * vy
+        cross_y = omega_z * vx - omega_x * vz
+        cross_z = omega_x * vy - omega_y * vx
+
+        magnus_factor = C0_AERO * (Cl / omega_mag) * v_mag
+        ax_magnus = magnus_factor * cross_x
+        ay_magnus = magnus_factor * cross_y
+        az_magnus = magnus_factor * cross_z
+
+        ax = ax_drag + ax_magnus
+        ay = ay_drag + ay_magnus
+        az = az_drag + az_magnus - GRAVITY
+
+        return np.array([vx, vy, vz, ax, ay, az])
+
+    state = np.array([x0, y0, z0, vx0, vy0, vz0], dtype=float)
+    trajectory = [state.copy()]
+    t = 0
+    max_time = 0.6
+
+    while state[1] > PLATE_Y and t < max_time:
+        k1 = derivatives(state)
+        k2 = derivatives(state + 0.5 * dt * k1)
+        k3 = derivatives(state + 0.5 * dt * k2)
+        k4 = derivatives(state + dt * k3)
+        state = state + (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+        trajectory.append(state.copy())
+        t += dt
+
+    trajectory = np.array(trajectory)
+    if len(trajectory) < 2:
+        return None, None, None
+
+    indices = np.linspace(0, len(trajectory) - 1, num_points).astype(int)
+    x = trajectory[indices, 0]
+    y = trajectory[indices, 1]
+    z = trajectory[indices, 2]
+
+    return x, y, z
+
+
+def calculate_single_trajectory(pitch_data, method='9p', num_points=50):
+    """Calculate trajectory for a single pitch using specified method."""
+    if method == 'ode':
+        return trajectory_ode_physics(pitch_data, num_points)
+    else:
+        return trajectory_9p_quadratic(pitch_data, num_points)
+
+
+# =============================================================================
+# ZONE CALCULATION HELPERS - From pitch_count.py
+# =============================================================================
+def mahalanobis_filter(points, threshold=2.5):
+    """Filter outliers using Mahalanobis distance."""
+    if len(points) < 4:
+        return points, np.ones(len(points), dtype=bool)
+
+    mean = np.mean(points, axis=0)
+    cov = np.cov(points.T)
+
+    try:
+        cov_inv = np.linalg.inv(cov)
+    except np.linalg.LinAlgError:
+        cov_inv = np.linalg.pinv(cov)
+
+    diff = points - mean
+    mahal_dist = np.sqrt(np.sum(diff @ cov_inv * diff, axis=1))
+    mask = mahal_dist <= threshold
+
+    if np.sum(mask) < 3:
+        sorted_indices = np.argsort(mahal_dist)[:3]
+        mask = np.zeros(len(points), dtype=bool)
+        mask[sorted_indices] = True
+
+    return points[mask], mask
+
+
+# =============================================================================
+# PITCHER TRAJECTORY REPORT - REPLACED VERSION (from pitch_count.py)
+# =============================================================================
+def get_averaged_trajectory(pitch_group, method='9p', num_points=50):
+    """Calculate average trajectory for a pitch type."""
+    trajectories_x = []
+    trajectories_y = []
+    trajectories_z = []
+    plate_locs = []
+
+    for idx, pitch in pitch_group.iterrows():
+        x, y, z = calculate_single_trajectory(pitch, method=method, num_points=num_points)
+        if x is not None and len(x) == num_points:
+            trajectories_x.append(x)
+            trajectories_y.append(y)
+            trajectories_z.append(z)
+            plate_locs.append({
+                'height': pitch['PlateLocHeight'],
+                'side': pitch['PlateLocSide']
+            })
+
+    if len(trajectories_x) == 0:
+        return None, None, None
+
+    avg_x = np.mean(trajectories_x, axis=0)
+    avg_y = np.mean(trajectories_y, axis=0)
+    avg_z = np.mean(trajectories_z, axis=0)
+
+    heights = [p['height'] for p in plate_locs]
+    sides = [p['side'] for p in plate_locs]
+
+    plate_loc_data = {
+        'height_mean': np.mean(heights),
+        'height_std': np.std(heights),
+        'side_mean': np.mean(sides),
+        'side_std': np.std(sides),
+        'count': len(trajectories_x)
+    }
+
+    return (avg_x, avg_y, avg_z), plate_loc_data, len(trajectories_x)
+
+
+def plot_side_view_trajectory(ax, pitcher_df, pitcher_name, handedness=""):
+    """Plot side view showing pitch arc from 1st base side perspective"""
+    title = f'Side View - 1B ({handedness})' if handedness else 'Side View - 1B'
+    ax.set_title(title, fontsize=12, fontweight='bold', color='white', pad=10)
+
+    # Draw sky gradient
+    ax.axhspan(0, 8, color='#1a3a52', alpha=0.3)
+
+    # Draw grass
+    ax.axhspan(-0.5, 0, color='#2E7D32', alpha=0.5)
+
+    # Draw dirt area near plate and mound
+    ax.fill_between([48, 65], -0.3, 0, color='#8B4513', alpha=0.4)
+    ax.fill_between([-2, 5], -0.3, 0, color='#8B4513', alpha=0.4)
+
+    # Draw mound
+    mound_x = [55, 58, 60.5, 63, 66]
+    mound_y = [0, 0.3, 0.5, 0.3, 0]
+    ax.fill(mound_x, mound_y, color='#8B4513', alpha=0.6)
+
+    # Draw rubber
+    ax.plot([60, 61], [0.55, 0.55], 'w-', linewidth=4, solid_capstyle='butt')
+
+    # Draw home plate
+    ax.plot([-0.5, 0.5], [0, 0], 'w-', linewidth=3)
+
+    # Draw strike zone at plate
+    ax.fill_between([-0.3, 0.3], STRIKE_ZONE_HEIGHT_LOW, STRIKE_ZONE_HEIGHT_HIGH,
+                    alpha=0.2, color='white')
+    ax.plot([-0.3, 0.3, 0.3, -0.3, -0.3],
+            [STRIKE_ZONE_HEIGHT_LOW, STRIKE_ZONE_HEIGHT_LOW,
+             STRIKE_ZONE_HEIGHT_HIGH, STRIKE_ZONE_HEIGHT_HIGH, STRIKE_ZONE_HEIGHT_LOW],
+            'w-', linewidth=1.5, alpha=0.7)
+
+    release_distances = []
+
+    for pitch_type in pitcher_df['TaggedPitchType'].unique():
+        if pd.isna(pitch_type):
+            continue
+
+        pitch_group = pitcher_df[pitcher_df['TaggedPitchType'] == pitch_type]
+        trajectory_data, plate_loc_data, count = get_averaged_trajectory(pitch_group)
+
+        if trajectory_data is None:
+            continue
+
+        x, y, z = trajectory_data
+        color = PITCH_COLORS.get(pitch_type, PITCH_COLORS['Other'])
+        release_distances.append(y[0])
+
+        ax.plot(y, z, color=color, linewidth=3, alpha=0.9)
+
+        ball_indices = np.linspace(0, len(y) - 1, 6).astype(int)
+        for idx in ball_indices:
+            ax.scatter(y[idx], z[idx], s=100, color='white',
+                       edgecolors=color, linewidth=2, alpha=0.9, zorder=5)
+
+    if release_distances:
+        avg_release = np.mean(release_distances)
+        ax.text(avg_release, 7.2, f'Release\n~{avg_release:.0f} ft',
+                ha='center', fontsize=9, color='white', alpha=0.7)
+
+    ax.text(0, -0.5, 'Plate', ha='center', fontsize=9, color='white', alpha=0.7)
+
+    ax.set_xlim(-5, 55)
+    ax.set_ylim(-0.8, 7.5)
+    ax.set_xlabel('Distance from Plate (ft)', fontsize=10, color='white')
+    ax.set_ylabel('Height (ft)', fontsize=10, color='white')
+    ax.tick_params(colors='white')
+    for spine in ax.spines.values():
+        spine.set_color('white')
+    ax.grid(True, alpha=0.15, color='white')
+    ax.invert_xaxis()
+
+
+def plot_catcher_view_trajectory(ax, pitcher_df, pitcher_name, handedness=""):
+    """Plot catcher's view with strike zone, trajectories, and KDE zones."""
+    title = f"Catcher's View ({handedness})" if handedness else "Catcher's View"
+    ax.set_title(title, fontsize=12, fontweight='bold', color='white', pad=10)
+
+    # Draw background
+    ax.axhspan(-1, 8, color='#3d2817', alpha=0.3)
+
+    # Draw strike zone
+    strike_zone = Rectangle((-STRIKE_ZONE_WIDTH / 2, STRIKE_ZONE_HEIGHT_LOW),
+                            STRIKE_ZONE_WIDTH,
+                            STRIKE_ZONE_HEIGHT_HIGH - STRIKE_ZONE_HEIGHT_LOW,
+                            fill=True, facecolor='#ffffff', alpha=0.15,
+                            edgecolor='white', linewidth=2)
+    ax.add_patch(strike_zone)
+
+    # Draw strike zone grid (9 sections)
+    for i in range(1, 3):
+        h = STRIKE_ZONE_HEIGHT_LOW + i * (STRIKE_ZONE_HEIGHT_HIGH - STRIKE_ZONE_HEIGHT_LOW) / 3
+        ax.plot([-STRIKE_ZONE_WIDTH / 2, STRIKE_ZONE_WIDTH / 2], [h, h],
+                'w-', alpha=0.3, linewidth=1)
+        v = -STRIKE_ZONE_WIDTH / 2 + i * STRIKE_ZONE_WIDTH / 3
+        ax.plot([v, v], [STRIKE_ZONE_HEIGHT_LOW, STRIKE_ZONE_HEIGHT_HIGH],
+                'w-', alpha=0.3, linewidth=1)
+
+    # Draw home plate
+    plate_points = np.array([
+        [-PLATE_WIDTH / 2, 1.0],
+        [PLATE_WIDTH / 2, 1.0],
+        [PLATE_WIDTH / 2, 0.85],
+        [0, 0.7],
+        [-PLATE_WIDTH / 2, 0.85],
+        [-PLATE_WIDTH / 2, 1.0]
+    ])
+    plate = Polygon(plate_points, closed=True, facecolor='white',
+                    edgecolor='#333', linewidth=2, alpha=0.9)
+    ax.add_patch(plate)
+
+    # Add 1B/3B labels
+    ax.text(-2.0, 0.6, '3B', fontsize=10, color='white', alpha=0.6, ha='center')
+    ax.text(2.0, 0.6, '1B', fontsize=10, color='white', alpha=0.6, ha='center')
+
+    # Collect pitch data for each type
+    pitch_data_list = []
+
+    for pitch_type in pitcher_df['TaggedPitchType'].unique():
+        if pd.isna(pitch_type):
+            continue
+
+        pitch_group = pitcher_df[pitcher_df['TaggedPitchType'] == pitch_type]
+        trajectory_data, plate_loc_data, count = get_averaged_trajectory(pitch_group)
+
+        if trajectory_data is None or plate_loc_data is None:
+            continue
+
+        x, y, z = trajectory_data
+        color = PITCH_COLORS.get(pitch_type, PITCH_COLORS['Other'])
+
+        # Get individual pitch locations for zone calculation
+        sides = pitch_group['PlateLocSide'].dropna().values
+        heights = pitch_group['PlateLocHeight'].dropna().values
+
+        # Negate sides to match trajectory x-coordinate convention
+        sides_negated = -sides
+
+        pitch_data_list.append({
+            'pitch_type': pitch_type,
+            'x': x, 'y': y, 'z': z,
+            'color': color,
+            'final_x': x[-1],
+            'final_z': z[-1],
+            'sides': sides_negated,
+            'heights': heights,
+            'avg_side': -plate_loc_data['side_mean'],
+            'avg_height': plate_loc_data['height_mean'],
+            'count': count
+        })
+
+    # Sort by count (draw smaller samples on top for visibility)
+    pitch_data_list.sort(key=lambda d: d['count'], reverse=True)
+
+    # Draw KDE zones
+    for data in pitch_data_list:
+        sides = data['sides']
+        heights = data['heights']
+        color = data['color']
+
+        if len(sides) < 4:
+            continue
+
+        points = np.column_stack([sides, heights])
+        filtered_points, mask = mahalanobis_filter(points, threshold=2.5)
+
+        if len(filtered_points) < 4:
+            continue
+
+        sides_filt = filtered_points[:, 0]
+        heights_filt = filtered_points[:, 1]
+
+        try:
+            positions = np.vstack([sides_filt, heights_filt])
+            kernel = stats.gaussian_kde(positions, bw_method='scott')
+            kernel.set_bandwidth(kernel.factor * 1.2)
+
+            x_margin = 0.3
+            y_margin = 0.3
+            x_grid = np.linspace(sides_filt.min() - x_margin,
+                                sides_filt.max() + x_margin, 80)
+            y_grid = np.linspace(heights_filt.min() - y_margin,
+                                heights_filt.max() + y_margin, 80)
+            X, Y = np.meshgrid(x_grid, y_grid)
+            positions_grid = np.vstack([X.ravel(), Y.ravel()])
+            Z = kernel(positions_grid).reshape(X.shape)
+
+            z_flat = Z.flatten()
+            z_sorted = np.sort(z_flat)[::-1]
+            cumsum = np.cumsum(z_sorted)
+            cumsum_norm = cumsum / cumsum[-1]
+
+            target_percentile = 0.25
+            idx = np.searchsorted(cumsum_norm, target_percentile)
+            if idx < len(z_sorted):
+                contour_level = z_sorted[idx]
+            else:
+                contour_level = z_sorted[-1]
+
+            ax.contourf(X, Y, Z, levels=[contour_level, Z.max()],
+                       colors=[color], alpha=0.35, zorder=1)
+            ax.contour(X, Y, Z, levels=[contour_level],
+                      colors=[color], alpha=0.7, linewidths=2.0, zorder=2)
+
+        except Exception:
+            ax.scatter(sides_filt, heights_filt, s=30, color=color, alpha=0.3, zorder=1)
+
+    # Draw trajectories and average dots
+    for data in pitch_data_list:
+        x, z = data['x'], data['z']
+        color = data['color']
+
+        # Draw trajectory as fading trail
+        num_trail_balls = 10
+        trail_indices = np.linspace(0, len(x) - 1, num_trail_balls).astype(int)
+
+        for i, idx in enumerate(trail_indices):
+            progress = i / len(trail_indices)
+            alpha = 0.1 + 0.5 * progress
+            size = 30 + 120 * progress
+            ax.scatter(x[idx], z[idx], s=size, color=color, alpha=alpha, zorder=3)
+
+        # Draw trajectory line
+        ax.plot(x, z, color=color, linewidth=2, alpha=0.5, zorder=2)
+
+        # Draw average location dot
+        ax.scatter(data['avg_side'], data['avg_height'], s=280, color=color,
+                   edgecolors='white', linewidth=2.5, alpha=0.95, zorder=5)
+
+    ax.set_xlim(-2.5, 2.5)
+    ax.set_ylim(0.5, 6.25)
+    ax.set_xlabel('Horizontal (ft)', fontsize=10, color='white')
+    ax.set_ylabel('Height (ft)', fontsize=10, color='white')
+    ax.set_aspect('equal')
+    ax.tick_params(colors='white')
+    for spine in ax.spines.values():
+        spine.set_color('white')
+    ax.grid(True, alpha=0.15, color='white')
+
+
+def create_pitcher_trajectory_report(df, pitcher_name):
+    """Create pitcher trajectory report with RHH/LHH splits - NEW VERSION from pitch_count.py"""
+    pitcher_df = df[df['Pitcher'] == pitcher_name].copy()
+
+    if len(pitcher_df) == 0:
+        return None
+
+    # Required columns for trajectory
+    required_cols = ['x0', 'z0', 'vx0', 'vy0', 'vz0', 'ax0', 'ay0', 'az0',
+                     'PlateLocHeight', 'PlateLocSide']
+
+    pitcher_df = pitcher_df.dropna(subset=required_cols)
+
+    if len(pitcher_df) == 0:
+        return None
+
+    # Combine ChangeUp and Splitter
+    changeup_count = len(pitcher_df[pitcher_df['TaggedPitchType'] == 'ChangeUp'])
+    splitter_count = len(pitcher_df[pitcher_df['TaggedPitchType'] == 'Splitter'])
+    if changeup_count > 0 or splitter_count > 0:
+        if changeup_count >= splitter_count:
+            pitcher_df.loc[pitcher_df['TaggedPitchType'] == 'Splitter', 'TaggedPitchType'] = 'ChangeUp'
+        else:
+            pitcher_df.loc[pitcher_df['TaggedPitchType'] == 'ChangeUp', 'TaggedPitchType'] = 'Splitter'
+
+    # Split by batter handedness
+    rhh_df = pitcher_df[pitcher_df['BatterSide'] == 'Right'].copy()
+    lhh_df = pitcher_df[pitcher_df['BatterSide'] == 'Left'].copy()
+
+    # Create figure with dark background
+    fig = plt.figure(figsize=(16, 12), facecolor='#1a1a2e')
+    gs = fig.add_gridspec(2, 2, width_ratios=[1.3, 1.0], wspace=0.12, hspace=0.20)
+
+    # TOP ROW: vs RHH
+    ax1_rhh = fig.add_subplot(gs[0, 0], facecolor='#1a1a2e')
+    ax2_rhh = fig.add_subplot(gs[0, 1], facecolor='#1a1a2e')
+
+    if len(rhh_df) > 0:
+        plot_side_view_trajectory(ax1_rhh, rhh_df, pitcher_name, "vs RHH")
+        plot_catcher_view_trajectory(ax2_rhh, rhh_df, pitcher_name, "vs RHH")
+    else:
+        ax1_rhh.set_title("Side View - 1B (vs RHH)", fontsize=12, fontweight='bold', color='white')
+        ax1_rhh.text(0.5, 0.5, 'No Data', transform=ax1_rhh.transAxes,
+                    fontsize=20, color='white', alpha=0.5, ha='center', va='center')
+        ax2_rhh.set_title("Catcher's View (vs RHH)", fontsize=12, fontweight='bold', color='white')
+        ax2_rhh.text(0.5, 0.5, 'No Data', transform=ax2_rhh.transAxes,
+                    fontsize=20, color='white', alpha=0.5, ha='center', va='center')
+
+    # BOTTOM ROW: vs LHH
+    ax1_lhh = fig.add_subplot(gs[1, 0], facecolor='#1a1a2e')
+    ax2_lhh = fig.add_subplot(gs[1, 1], facecolor='#1a1a2e')
+
+    if len(lhh_df) > 0:
+        plot_side_view_trajectory(ax1_lhh, lhh_df, pitcher_name, "vs LHH")
+        plot_catcher_view_trajectory(ax2_lhh, lhh_df, pitcher_name, "vs LHH")
+    else:
+        ax1_lhh.set_title("Side View - 1B (vs LHH)", fontsize=12, fontweight='bold', color='white')
+        ax1_lhh.text(0.5, 0.5, 'No Data', transform=ax1_lhh.transAxes,
+                    fontsize=20, color='white', alpha=0.5, ha='center', va='center')
+        ax2_lhh.set_title("Catcher's View (vs LHH)", fontsize=12, fontweight='bold', color='white')
+        ax2_lhh.text(0.5, 0.5, 'No Data', transform=ax2_lhh.transAxes,
+                    fontsize=20, color='white', alpha=0.5, ha='center', va='center')
+
+    # Get pitcher handedness
+    pitcher_hand = pitcher_df['PitcherThrows'].iloc[0] if 'PitcherThrows' in pitcher_df.columns else "Unknown"
+
+    plt.suptitle(f'Pitch Trajectory Analysis - {pitcher_name} ({pitcher_hand}HP)',
+                 fontsize=16, fontweight='bold', y=0.98, color='white')
+
+    # Extract dates
+    if '_source_file' in pitcher_df.columns:
+        source_files = pitcher_df['_source_file'].unique()
+        dates = []
+        for f in source_files:
+            match = re.match(r'(\d{8})', f)
+            if match:
+                date_str = match.group(1)
+                formatted_date = f"{date_str[4:6]}/{date_str[6:8]}/{date_str[:4]}"
+                dates.append(formatted_date)
+        if dates:
+            date_label = " | ".join(sorted(set(dates)))
+            fig.text(0.5, 0.94, date_label, ha='center', fontsize=11, color='#aaaaaa')
+    elif 'Date' in pitcher_df.columns:
+        dates = pitcher_df['Date'].unique()
+        date_label = ", ".join([str(d) for d in sorted(dates)])
+        fig.text(0.5, 0.94, date_label, ha='center', fontsize=11, color='#aaaaaa')
+
+    plt.tight_layout(rect=[0, 0.10, 1, 0.94])
+
+    # Add legend
+    pitch_types = sorted(pitcher_df['TaggedPitchType'].dropna().unique())
+    rhh_elements = []
+    lhh_elements = []
+    total_elements = []
+
+    for pitch_type in pitch_types:
+        color = PITCH_COLORS.get(pitch_type, PITCH_COLORS['Other'])
+        pitch_df_type = pitcher_df[pitcher_df['TaggedPitchType'] == pitch_type]
+        total_count = len(pitch_df_type)
+        lhh_count = len(pitch_df_type[pitch_df_type['BatterSide'] == 'Left'])
+        rhh_count = len(pitch_df_type[pitch_df_type['BatterSide'] == 'Right'])
+
+        rhh_elements.append(plt.Line2D([0], [0], color=color, linewidth=4,
+                                       label=f'{pitch_type} (R={rhh_count})'))
+        lhh_elements.append(plt.Line2D([0], [0], color=color, linewidth=4,
+                                       label=f'{pitch_type} (L={lhh_count})'))
+        total_elements.append(plt.Line2D([0], [0], color=color, linewidth=4,
+                                         label=f'{pitch_type} (n={total_count})'))
+
+    if pitch_types:
+        leg1 = fig.legend(handles=rhh_elements, loc='lower center', ncol=len(pitch_types),
+                          fontsize=9, framealpha=0.8, facecolor='#2d2d44', edgecolor='white',
+                          labelcolor='white', bbox_to_anchor=(0.5, 0.045))
+
+        leg2 = fig.legend(handles=lhh_elements, loc='lower center', ncol=len(pitch_types),
+                          fontsize=9, framealpha=0.8, facecolor='#2d2d44', edgecolor='white',
+                          labelcolor='white', bbox_to_anchor=(0.5, 0.022))
+
+        leg3 = fig.legend(handles=total_elements, loc='lower center', ncol=len(pitch_types),
+                          fontsize=9, framealpha=0.8, facecolor='#2d2d44', edgecolor='white',
+                          labelcolor='white', bbox_to_anchor=(0.5, -0.001))
+
+        fig.add_artist(leg1)
+        fig.add_artist(leg2)
+
+    return fig
+
+
+# =============================================================================
+# ORIGINAL PITCHER GRAPHIC (kept as alternative view)
 # =============================================================================
 def draw_zone_with_regions(ax):
     """Draw strike zone with heart and shadow regions"""
@@ -335,169 +1016,22 @@ def draw_zone_with_regions(ax):
                               linewidth=1, linestyle='--')
     ax.add_patch(heart)
 
-    # Grid lines
     for x in [-0.71 / 3, 0.71 / 3]:
         ax.plot([x, x], [1.5, 3.5], 'k-', alpha=0.2, linewidth=0.5)
     for y in [1.5 + 2 / 3, 1.5 + 4 / 3]:
         ax.plot([-0.71, 0.71], [y, y], 'k-', alpha=0.2, linewidth=0.5)
 
 
-def create_pitcher_graphic(df, pitcher_name):
-    """Create pitcher graphic with RHH/LHH splits and catcher view - from change.py"""
-    pitcher_df = df[df['Pitcher'] == pitcher_name].copy()
-
-    if len(pitcher_df) == 0:
-        return None
-
-    fig = plt.figure(figsize=(18, 10))
-    fig.patch.set_facecolor('white')
-
-    # Get date range
-    dates = pitcher_df['Date'].unique()
-    date_str = ', '.join(sorted([str(d) for d in dates]))
-
-    fig.suptitle(f'{pitcher_name} - Pitcher Report\n{date_str}',
-                 fontsize=18, fontweight='bold')
-
-    # All pitches - Catcher's view
-    ax1 = plt.subplot(2, 3, 1)
-    ax1.set_xlim(-3, 3)
-    ax1.set_ylim(0, 5)
-    ax1.set_aspect('equal')
-    ax1.set_title('All Pitches (Catcher View)', fontsize=12, fontweight='bold')
-    ax1.set_xlabel('Horizontal Location (ft)')
-    ax1.set_ylabel('Vertical Location (ft)')
-    draw_zone_with_regions(ax1)
-
-    for pitch_type in pitcher_df['TaggedPitchType'].dropna().unique():
-        type_df = pitcher_df[pitcher_df['TaggedPitchType'] == pitch_type]
-        color = get_pitch_color(pitch_type)
-        x = type_df['PlateLocSide'].dropna()
-        z = type_df['PlateLocHeight'].dropna()
-        if len(x) > 0:
-            ax1.scatter(x, z, c=color, s=60, alpha=0.7, edgecolors='black',
-                       linewidth=0.5, label=f"{pitch_type} ({len(type_df)})")
-    ax1.legend(loc='upper right', fontsize=8)
-    ax1.grid(True, alpha=0.2)
-
-    # vs RHH
-    ax2 = plt.subplot(2, 3, 4)
-    rhh_df = pitcher_df[pitcher_df['BatterSide'] == 'Right']
-    ax2.set_xlim(-3, 3)
-    ax2.set_ylim(0, 5)
-    ax2.set_aspect('equal')
-    ax2.set_title(f'vs RHH ({len(rhh_df)} pitches)', fontsize=12, fontweight='bold')
-    ax2.set_xlabel('Horizontal Location (ft)')
-    ax2.set_ylabel('Vertical Location (ft)')
-    draw_zone_with_regions(ax2)
-
-    for pitch_type in rhh_df['TaggedPitchType'].dropna().unique():
-        type_df = rhh_df[rhh_df['TaggedPitchType'] == pitch_type]
-        color = get_pitch_color(pitch_type)
-        x = type_df['PlateLocSide'].dropna()
-        z = type_df['PlateLocHeight'].dropna()
-        if len(x) > 0:
-            ax2.scatter(x, z, c=color, s=60, alpha=0.7, edgecolors='black', linewidth=0.5)
-    ax2.grid(True, alpha=0.2)
-
-    # vs LHH
-    ax3 = plt.subplot(2, 3, 5)
-    lhh_df = pitcher_df[pitcher_df['BatterSide'] == 'Left']
-    ax3.set_xlim(-3, 3)
-    ax3.set_ylim(0, 5)
-    ax3.set_aspect('equal')
-    ax3.set_title(f'vs LHH ({len(lhh_df)} pitches)', fontsize=12, fontweight='bold')
-    ax3.set_xlabel('Horizontal Location (ft)')
-    ax3.set_ylabel('Vertical Location (ft)')
-    draw_zone_with_regions(ax3)
-
-    for pitch_type in lhh_df['TaggedPitchType'].dropna().unique():
-        type_df = lhh_df[lhh_df['TaggedPitchType'] == pitch_type]
-        color = get_pitch_color(pitch_type)
-        x = type_df['PlateLocSide'].dropna()
-        z = type_df['PlateLocHeight'].dropna()
-        if len(x) > 0:
-            ax3.scatter(x, z, c=color, s=60, alpha=0.7, edgecolors='black', linewidth=0.5)
-    ax3.grid(True, alpha=0.2)
-
-    # Pitch Mix pie chart
-    ax4 = plt.subplot(2, 3, 3)
-    pitch_counts = pitcher_df['TaggedPitchType'].value_counts()
-    colors = [get_pitch_color(pt) for pt in pitch_counts.index]
-    ax4.pie(pitch_counts.values, labels=pitch_counts.index, autopct='%1.1f%%',
-            colors=colors, startangle=90)
-    ax4.set_title('Pitch Mix', fontsize=12, fontweight='bold')
-
-    # Velocity by pitch type
-    ax5 = plt.subplot(2, 3, 6)
-    pitch_types = pitcher_df['TaggedPitchType'].dropna().unique()
-    velo_data = []
-    labels = []
-    colors_box = []
-    for pt in pitch_types:
-        velos = pitcher_df[pitcher_df['TaggedPitchType'] == pt]['RelSpeed'].dropna()
-        if len(velos) > 0:
-            velo_data.append(velos.values)
-            labels.append(pt)
-            colors_box.append(get_pitch_color(pt))
-
-    if velo_data:
-        bp = ax5.boxplot(velo_data, labels=labels, patch_artist=True)
-        for patch, color in zip(bp['boxes'], colors_box):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.7)
-    ax5.set_title('Velocity by Pitch Type', fontsize=12, fontweight='bold')
-    ax5.set_ylabel('Velocity (mph)')
-    ax5.grid(True, alpha=0.3)
-    plt.setp(ax5.xaxis.get_majorticklabels(), rotation=45, ha='right')
-
-    # Balls in play field map
-    ax6 = plt.subplot(2, 3, 2)
-    bip = pitcher_df[(pitcher_df['PitchCall'] == 'InPlay') &
-                     pitcher_df['Direction'].notna() &
-                     pitcher_df['Distance'].notna()]
-
-    ax6.set_xlim(-250, 250)
-    ax6.set_ylim(0, 450)
-    ax6.set_aspect('equal')
-    ax6.set_title(f'Balls in Play ({len(bip)})', fontsize=12, fontweight='bold')
-    ax6.set_facecolor('#2d5016')
-    ax6.axis('off')
-
-    # Draw field
-    diamond = plt.Polygon([(0, 0), (-90, 90), (0, 180), (90, 90)],
-                          fill=False, edgecolor='white', linewidth=2)
-    ax6.add_patch(diamond)
-    arc = patches.Arc((0, 0), 500, 500, theta1=45, theta2=135, color='white', linewidth=2)
-    ax6.add_patch(arc)
-
-    result_colors = {'Out': '#95a5a6', 'Single': '#3498db', 'Double': '#f39c12',
-                     'Triple': '#9b59b6', 'HomeRun': '#e74c3c', 'Error': '#1abc9c'}
-
-    for _, ball in bip.iterrows():
-        angle_rad = np.radians(ball['Direction'])
-        dist = ball['Distance']
-        x = dist * np.sin(angle_rad)
-        y = dist * np.cos(angle_rad)
-        result = ball.get('PlayResult', 'Out')
-        color = result_colors.get(result, '#95a5a6')
-        ax6.plot(x, y, 'o', color=color, markersize=8, markeredgecolor='white', markeredgewidth=0.5)
-
-    plt.tight_layout()
-    return fig
-
-
 # =============================================================================
-# PITCHER SCRIMMAGE REPORT - From trackman_analytics.py
+# PITCHER SCRIMMAGE REPORT
 # =============================================================================
 def create_pitcher_scrimmage_report(df, pitcher_name):
-    """Create detailed pitcher scrimmage report - from trackman_analytics.py"""
+    """Create detailed pitcher scrimmage report"""
     pitches = df[df['Pitcher'] == pitcher_name].copy()
 
     if len(pitches) == 0:
         return None, None
 
-    # Calculate stats
     total = len(pitches)
     strikes = pitches[pitches['PitchCall'].isin(['StrikeCalled', 'StrikeSwinging', 'FoulBall', 'InPlay'])]
     strike_pct = len(strikes) / total * 100 if total > 0 else 0
@@ -508,7 +1042,6 @@ def create_pitcher_scrimmage_report(df, pitcher_name):
 
     bip_count = len(pitches[pitches['PitchCall'] == 'InPlay'])
 
-    # Pitch type breakdown
     pitch_stats = pitches.groupby('TaggedPitchType').agg({
         'PitchNo': 'count',
         'RelSpeed': ['mean', 'max'],
@@ -520,7 +1053,6 @@ def create_pitcher_scrimmage_report(df, pitcher_name):
     pitch_stats.columns = ['Count', 'Avg Velo', 'Max Velo', 'Avg Spin', 'V Break', 'H Break']
     pitch_stats['Usage %'] = (pitch_stats['Count'] / total * 100).round(1)
 
-    # Create figure
     fig = plt.figure(figsize=(16, 10))
     fig.patch.set_facecolor('white')
 
@@ -528,7 +1060,6 @@ def create_pitcher_scrimmage_report(df, pitcher_name):
     date_str = ', '.join(sorted([str(d) for d in dates]))
     fig.suptitle(f'{pitcher_name} - Scrimmage Report\n{date_str}', fontsize=16, fontweight='bold')
 
-    # Strike zone
     ax1 = plt.subplot(2, 3, 1)
     ax1.set_xlim(-3, 3)
     ax1.set_ylim(0, 5)
@@ -547,7 +1078,6 @@ def create_pitcher_scrimmage_report(df, pitcher_name):
     ax1.legend(loc='upper right', fontsize=7)
     ax1.grid(True, alpha=0.2)
 
-    # vs RHH
     ax2 = plt.subplot(2, 3, 4)
     rhh_df = pitches[pitches['BatterSide'] == 'Right']
     ax2.set_xlim(-3, 3)
@@ -564,7 +1094,6 @@ def create_pitcher_scrimmage_report(df, pitcher_name):
             ax2.scatter(x, z, c=color, s=50, alpha=0.7, edgecolors='black', linewidth=0.5)
     ax2.grid(True, alpha=0.2)
 
-    # vs LHH
     ax3 = plt.subplot(2, 3, 5)
     lhh_df = pitches[pitches['BatterSide'] == 'Left']
     ax3.set_xlim(-3, 3)
@@ -581,7 +1110,6 @@ def create_pitcher_scrimmage_report(df, pitcher_name):
             ax3.scatter(x, z, c=color, s=50, alpha=0.7, edgecolors='black', linewidth=0.5)
     ax3.grid(True, alpha=0.2)
 
-    # Pitch mix
     ax4 = plt.subplot(2, 3, 3)
     pitch_counts = pitches['TaggedPitchType'].value_counts()
     colors = [get_pitch_color(pt) for pt in pitch_counts.index]
@@ -589,7 +1117,6 @@ def create_pitcher_scrimmage_report(df, pitcher_name):
             colors=colors, startangle=90)
     ax4.set_title('Pitch Mix', fontsize=11, fontweight='bold')
 
-    # Velocity distribution
     ax5 = plt.subplot(2, 3, 6)
     pitch_types = pitches['TaggedPitchType'].dropna().unique()
     velo_data = []
@@ -612,7 +1139,6 @@ def create_pitcher_scrimmage_report(df, pitcher_name):
     ax5.grid(True, alpha=0.3)
     plt.setp(ax5.xaxis.get_majorticklabels(), rotation=45, ha='right')
 
-    # Stats text
     ax_text = plt.subplot(2, 3, 2)
     ax_text.axis('off')
     stats_text = f"""OVERALL STATS
@@ -635,10 +1161,10 @@ vs LHH: {len(lhh_df)} pitches
 
 
 # =============================================================================
-# HITTER SCRIMMAGE REPORT - From trackman_analytics.py
+# HITTER SCRIMMAGE REPORT
 # =============================================================================
 def create_hitter_scrimmage_report(df, hitter_name):
-    """Create detailed hitter scrimmage report - from trackman_analytics.py"""
+    """Create detailed hitter scrimmage report"""
     pitches = df[df['Batter'] == hitter_name].copy()
 
     if len(pitches) == 0:
@@ -655,7 +1181,6 @@ def create_hitter_scrimmage_report(df, hitter_name):
 
     bip = pitches[(pitches['PitchCall'] == 'InPlay') & (pitches['ExitSpeed'].notna())]
 
-    # Create figure
     fig = plt.figure(figsize=(16, 10))
     fig.patch.set_facecolor('white')
 
@@ -663,7 +1188,6 @@ def create_hitter_scrimmage_report(df, hitter_name):
     date_str = ', '.join(sorted([str(d) for d in dates]))
     fig.suptitle(f'{hitter_name} - Hitter Report\n{date_str}', fontsize=16, fontweight='bold')
 
-    # Strike zone - pitches seen
     ax1 = plt.subplot(2, 3, 1)
     ax1.set_xlim(-3, 3)
     ax1.set_ylim(0, 5)
@@ -671,7 +1195,6 @@ def create_hitter_scrimmage_report(df, hitter_name):
     ax1.set_title('Pitches Seen', fontsize=11, fontweight='bold')
     draw_zone_with_regions(ax1)
 
-    # Color by call
     call_colors = {
         'StrikeCalled': '#e74c3c',
         'BallCalled': '#3498db',
@@ -689,7 +1212,6 @@ def create_hitter_scrimmage_report(df, hitter_name):
     ax1.legend(loc='upper right', fontsize=7)
     ax1.grid(True, alpha=0.2)
 
-    # Spray chart
     ax2 = plt.subplot(2, 3, 2)
     bip_with_loc = pitches[(pitches['PitchCall'] == 'InPlay') &
                            pitches['Direction'].notna() &
@@ -698,7 +1220,7 @@ def create_hitter_scrimmage_report(df, hitter_name):
     ax2.set_xlim(-250, 250)
     ax2.set_ylim(0, 450)
     ax2.set_aspect('equal')
-    ax2.set_title(f'Batted Ball Chart ({len(bip_with_loc)})', fontsize=11, fontweight='bold')
+    ax2.set_title(f'Spray Chart ({len(bip_with_loc)} BIP)', fontsize=11, fontweight='bold')
     ax2.set_facecolor('#2d5016')
     ax2.axis('off')
 
@@ -718,381 +1240,238 @@ def create_hitter_scrimmage_report(df, hitter_name):
         y = dist * np.cos(angle_rad)
         result = ball.get('PlayResult', 'Out')
         color = result_colors.get(result, '#95a5a6')
-        ax2.plot(x, y, 'o', color=color, markersize=10, markeredgecolor='white', markeredgewidth=0.5)
+        ax2.plot(x, y, 'o', color=color, markersize=8, markeredgecolor='white', markeredgewidth=0.5)
 
-    # Exit velo distribution
     ax3 = plt.subplot(2, 3, 4)
-    if len(bip) > 0:
-        ax3.hist(bip['ExitSpeed'], bins=15, color='#3498db', alpha=0.7, edgecolor='black')
-        ax3.axvline(bip['ExitSpeed'].mean(), color='red', linestyle='--',
-                   linewidth=2, label=f"Avg: {bip['ExitSpeed'].mean():.1f} mph")
-        ax3.set_title('Exit Velocity Distribution', fontsize=11, fontweight='bold')
-        ax3.set_xlabel('Exit Velocity (mph)')
-        ax3.set_ylabel('Count')
-        ax3.legend()
-        ax3.grid(True, alpha=0.3)
-    else:
-        ax3.text(0.5, 0.5, 'No batted ball data', ha='center', va='center')
-        ax3.axis('off')
-
-    # Launch angle distribution
-    ax4 = plt.subplot(2, 3, 5)
-    bip_la = pitches[(pitches['PitchCall'] == 'InPlay') & pitches['Angle'].notna()]
-    if len(bip_la) > 0:
-        ax4.hist(bip_la['Angle'], bins=15, color='#2ecc71', alpha=0.7, edgecolor='black')
-        ax4.axvline(bip_la['Angle'].mean(), color='red', linestyle='--',
-                   linewidth=2, label=f"Avg: {bip_la['Angle'].mean():.1f}°")
-        ax4.axvspan(8, 32, alpha=0.2, color='yellow', label='Sweet Spot (8-32°)')
-        ax4.set_title('Launch Angle Distribution', fontsize=11, fontweight='bold')
-        ax4.set_xlabel('Launch Angle (degrees)')
-        ax4.set_ylabel('Count')
-        ax4.legend()
-        ax4.grid(True, alpha=0.3)
-    else:
-        ax4.text(0.5, 0.5, 'No launch angle data', ha='center', va='center')
-        ax4.axis('off')
-
-    # EV vs LA scatter
-    ax5 = plt.subplot(2, 3, 6)
-    bip_scatter = pitches[(pitches['PitchCall'] == 'InPlay') &
-                          pitches['ExitSpeed'].notna() &
-                          pitches['Angle'].notna()]
-    if len(bip_scatter) > 0:
-        scatter = ax5.scatter(bip_scatter['Angle'], bip_scatter['ExitSpeed'],
-                             c=bip_scatter['Distance'].fillna(0), cmap='RdYlGn',
-                             s=100, alpha=0.7, edgecolors='black', linewidth=0.5)
-        ax5.axhspan(95, 115, xmin=0.35, xmax=0.65, alpha=0.1, color='gold')
-        ax5.axvspan(8, 32, alpha=0.1, color='gold')
-        ax5.set_title('Exit Velo vs Launch Angle', fontsize=11, fontweight='bold')
-        ax5.set_xlabel('Launch Angle (degrees)')
-        ax5.set_ylabel('Exit Velocity (mph)')
-        ax5.grid(True, alpha=0.3)
-        cbar = plt.colorbar(scatter, ax=ax5)
-        cbar.set_label('Distance (ft)', fontsize=9)
-    else:
-        ax5.text(0.5, 0.5, 'No batted ball data', ha='center', va='center')
-        ax5.axis('off')
-
-    # Stats text
-    ax_text = plt.subplot(2, 3, 3)
-    ax_text.axis('off')
-
-    stats_text = f"""OVERALL STATS
+    ax3.axis('off')
+    stats_text = f"""PLATE DISCIPLINE
 ━━━━━━━━━━━━━━━━━━━━
-Total Pitches: {total}
+Pitches Seen: {total}
 Swing %: {swing_pct:.1f}%
 Whiff %: {whiff_pct:.1f}%
 Contact %: {contact_pct:.1f}%
-"""
-    if len(bip) > 0:
-        hard_hit = len(bip[bip['ExitSpeed'] >= 95])
-        stats_text += f"""
-BATTED BALL METRICS
-━━━━━━━━━━━━━━━━━━━━
-Balls in Play: {len(bip)}
-Avg Exit Velo: {bip['ExitSpeed'].mean():.1f} mph
-Max Exit Velo: {bip['ExitSpeed'].max():.1f} mph
-Hard Hit % (≥95): {hard_hit / len(bip) * 100:.1f}%
-"""
-        if bip['Distance'].notna().sum() > 0:
-            stats_text += f"Avg Distance: {bip['Distance'].mean():.0f} ft\n"
-            stats_text += f"Max Distance: {bip['Distance'].max():.0f} ft"
 
-    ax_text.text(0.1, 0.95, stats_text, transform=ax_text.transAxes,
-                 fontsize=10, verticalalignment='top', family='monospace')
+QUALITY CONTACT
+━━━━━━━━━━━━━━━━━━━━
+Balls in Play: {len(bip)}"""
+    if len(bip) > 0:
+        stats_text += f"""
+Avg Exit Velo: {bip['ExitSpeed'].mean():.1f} mph
+Max Exit Velo: {bip['ExitSpeed'].max():.1f} mph"""
+        if 'Angle' in bip.columns and bip['Angle'].notna().sum() > 0:
+            stats_text += f"""
+Avg Launch Angle: {bip['Angle'].mean():.1f}°"""
+
+    ax3.text(0.1, 0.9, stats_text, transform=ax3.transAxes,
+             fontsize=11, verticalalignment='top', family='monospace')
+
+    ax4 = plt.subplot(2, 3, 3)
+    pitch_types = pitches['TaggedPitchType'].value_counts()
+    if len(pitch_types) > 0:
+        colors = [get_pitch_color(pt) for pt in pitch_types.index]
+        ax4.pie(pitch_types.values, labels=pitch_types.index, autopct='%1.1f%%',
+                colors=colors, startangle=90)
+    ax4.set_title('Pitch Types Seen', fontsize=11, fontweight='bold')
+
+    if len(bip) > 0:
+        ax5 = plt.subplot(2, 3, 5)
+        ax5.hist(bip['ExitSpeed'].dropna(), bins=15, color='#3498db', edgecolor='black', alpha=0.7)
+        ax5.axvline(bip['ExitSpeed'].mean(), color='red', linestyle='--', linewidth=2, label='Avg')
+        ax5.set_title('Exit Velocity Distribution', fontsize=11, fontweight='bold')
+        ax5.set_xlabel('Exit Velocity (mph)')
+        ax5.set_ylabel('Count')
+        ax5.legend()
+        ax5.grid(True, alpha=0.3)
+
+        if 'Angle' in bip.columns and bip['Angle'].notna().sum() > 0:
+            ax6 = plt.subplot(2, 3, 6)
+            ax6.hist(bip['Angle'].dropna(), bins=15, color='#2ecc71', edgecolor='black', alpha=0.7)
+            ax6.axvline(bip['Angle'].mean(), color='red', linestyle='--', linewidth=2, label='Avg')
+            ax6.set_title('Launch Angle Distribution', fontsize=11, fontweight='bold')
+            ax6.set_xlabel('Launch Angle (°)')
+            ax6.set_ylabel('Count')
+            ax6.legend()
+            ax6.grid(True, alpha=0.3)
 
     plt.tight_layout()
 
-    # Create summary dataframe
-    summary_data = {
-        'Metric': ['Total Pitches', 'Swing %', 'Whiff %', 'Contact %', 'Balls in Play',
-                   'Avg Exit Velo', 'Max Exit Velo', 'Hard Hit %'],
+    stats_df = pd.DataFrame({
+        'Metric': ['Pitches Seen', 'Swing %', 'Whiff %', 'Contact %', 'BIP',
+                   'Avg EV', 'Max EV'],
         'Value': [total, f'{swing_pct:.1f}%', f'{whiff_pct:.1f}%', f'{contact_pct:.1f}%',
-                  len(bip),
-                  f"{bip['ExitSpeed'].mean():.1f}" if len(bip) > 0 else 'N/A',
-                  f"{bip['ExitSpeed'].max():.1f}" if len(bip) > 0 else 'N/A',
-                  f"{len(bip[bip['ExitSpeed'] >= 95]) / len(bip) * 100:.1f}%" if len(bip) > 0 else 'N/A']
-    }
-    summary_df = pd.DataFrame(summary_data)
+                  len(bip), f"{bip['ExitSpeed'].mean():.1f}" if len(bip) > 0 else '-',
+                  f"{bip['ExitSpeed'].max():.1f}" if len(bip) > 0 else '-']
+    })
 
-    return fig, summary_df
+    return fig, stats_df
 
 
 # =============================================================================
-# AT-BAT REPORT (PDF) - From V2.py
+# AT-BAT SEQUENCES PDF
 # =============================================================================
-def trajectory_9p_quadratic(pitch_data, num_points=50):
-    """Calculate trajectory using 9-parameter quadratic model"""
-    x0 = pitch_data.get('x0')
-    y0 = pitch_data.get('y0', 50.0) if pd.notna(pitch_data.get('y0')) else 50.0
-    z0 = pitch_data.get('z0')
-    vx0 = pitch_data.get('vx0')
-    vy0 = pitch_data.get('vy0')
-    vz0 = pitch_data.get('vz0')
-    ax = pitch_data.get('ax0')
-    ay = pitch_data.get('ay0')
-    az = pitch_data.get('az0')
-
-    if any(pd.isna(v) for v in [x0, z0, vx0, vy0, vz0, ax, ay, az]):
-        return None, None, None
-
-    a_coef = 0.5 * ay
-    b_coef = vy0
-    c_coef = y0 - PLATE_Y
-
-    discriminant = b_coef ** 2 - 4 * a_coef * c_coef
-    if discriminant < 0:
-        return None, None, None
-
-    t_flight = (-b_coef - np.sqrt(discriminant)) / (2 * a_coef)
-    if t_flight <= 0:
-        t_flight = (-b_coef + np.sqrt(discriminant)) / (2 * a_coef)
-
-    if t_flight <= 0 or t_flight > 1.0:
-        return None, None, None
-
-    t = np.linspace(0, t_flight, num_points)
-    x = x0 + vx0 * t + 0.5 * ax * t ** 2
-    y = y0 + vy0 * t + 0.5 * ay * t ** 2
-    z = z0 + vz0 * t + 0.5 * az * t ** 2
-
-    return x, y, z
-
-
-def draw_strike_zone_pdf(ax):
-    """Draw strike zone for PDF report"""
-    zone_left = -PLATE_WIDTH / 2
-    zone_right = PLATE_WIDTH / 2
-
-    zone = Rectangle((zone_left, STRIKE_ZONE_HEIGHT_LOW),
-                     PLATE_WIDTH,
-                     STRIKE_ZONE_HEIGHT_HIGH - STRIKE_ZONE_HEIGHT_LOW,
-                     fill=False, edgecolor='white', linewidth=2, alpha=0.8)
-    ax.add_patch(zone)
-
-    for i in range(1, 3):
-        y = STRIKE_ZONE_HEIGHT_LOW + i * (STRIKE_ZONE_HEIGHT_HIGH - STRIKE_ZONE_HEIGHT_LOW) / 3
-        ax.plot([zone_left, zone_right], [y, y], 'w-', linewidth=0.5, alpha=0.5)
-
-    for i in range(1, 3):
-        x = zone_left + i * PLATE_WIDTH / 3
-        ax.plot([x, x], [STRIKE_ZONE_HEIGHT_LOW, STRIKE_ZONE_HEIGHT_HIGH],
-                'w-', linewidth=0.5, alpha=0.5)
-
-
 def create_at_bat_pdf(df, output_path):
-    """Create PDF report with at-bat pitch sequences - from V2.py"""
-    critical_cols = ['Date', 'Inning', 'Top/Bottom', 'PAofInning', 'Batter']
-    valid_mask = df[critical_cols].notna().all(axis=1)
-    df_valid = df[valid_mask].copy()
-
-    if len(df_valid) == 0:
-        return None
-
-    df_valid['AtBatID'] = (df_valid['Date'].astype(str) + '_' +
-                           df_valid['Inning'].astype(int).astype(str) + '_' +
-                           df_valid['Top/Bottom'].astype(str) + '_' +
-                           df_valid['PAofInning'].astype(int).astype(str))
-
-    at_bats = df_valid.groupby('AtBatID')
+    """Create PDF with at-bat sequences"""
+    # Group by at-bats
+    abs_grouped = df.groupby(['Pitcher', 'Batter', 'Inning', 'PAofInning'])
 
     with PdfPages(output_path) as pdf:
-        for ab_id, ab_df in at_bats:
-            ab_df = ab_df.sort_values('PitchofPA')
+        for (pitcher, batter, inning, pa), ab_df in abs_grouped:
+            ab_df = ab_df.sort_values('PitchNo')
 
-            fig = plt.figure(figsize=(11, 8.5), facecolor='#1a1a2e')
+            if len(ab_df) == 0:
+                continue
 
-            batter = ab_df['Batter'].iloc[0]
-            inning = ab_df['Inning'].iloc[0]
-            top_bottom = ab_df['Top/Bottom'].iloc[0]
-            batter_side = ab_df['BatterSide'].iloc[0] if 'BatterSide' in ab_df.columns else ''
-            side_abbrev = "RHH" if batter_side == "Right" else "LHH"
-            pa_of_inning = ab_df['PAofInning'].iloc[0]
-            date = ab_df['Date'].iloc[0]
+            fig = plt.figure(figsize=(11, 8.5))
+            fig.suptitle(f'{pitcher} vs {batter}\nInning {inning}, PA #{pa}',
+                        fontsize=14, fontweight='bold')
 
-            play_result = ab_df['PlayResult'].iloc[-1] if pd.notna(ab_df['PlayResult'].iloc[-1]) else ''
+            ax1 = plt.subplot(1, 2, 1)
+            ax1.set_xlim(-3, 3)
+            ax1.set_ylim(0, 5)
+            ax1.set_aspect('equal')
+            ax1.set_title("Catcher's View", fontsize=11)
+            draw_zone_with_regions(ax1)
 
-            title = f"AB{int(pa_of_inning)} - {batter} ({side_abbrev})"
-            subtitle = f"Inning {int(inning)} {top_bottom} | {date} | {len(ab_df)} Pitches"
-            if play_result:
-                subtitle += f" | Result: {play_result}"
-
-            fig.suptitle(title, fontsize=14, fontweight='bold', color='white', y=0.96)
-            fig.text(0.5, 0.91, subtitle, ha='center', fontsize=10, color='#aaaaaa')
-
-            # Side view
-            ax1 = fig.add_axes([0.05, 0.45, 0.9, 0.4])
-            ax1.set_facecolor('#1a1a2e')
-            ax1.set_title('Side View (1B Side)', fontsize=11, fontweight='bold', color='white')
-
-            # Draw mound
-            ax1.fill_between([55, 66], 0, 0.5, color='#8B4513', alpha=0.4)
-            ax1.plot([60, 61], [0.55, 0.55], 'w-', linewidth=4)
-            ax1.fill_between([0, 2], -0.15, 0.15, color='white', alpha=0.9)
-
-            # Strike zone at plate
-            ax1.fill_between([0, 2], STRIKE_ZONE_HEIGHT_LOW, STRIKE_ZONE_HEIGHT_HIGH, alpha=0.2, color='white')
-            ax1.plot([0, 2, 2, 0, 0],
-                     [STRIKE_ZONE_HEIGHT_LOW, STRIKE_ZONE_HEIGHT_LOW,
-                      STRIKE_ZONE_HEIGHT_HIGH, STRIKE_ZONE_HEIGHT_HIGH, STRIKE_ZONE_HEIGHT_LOW],
-                     'w-', linewidth=1.5, alpha=0.7)
-
-            # Plot trajectories
-            for idx, (_, pitch) in enumerate(ab_df.iterrows(), 1):
-                pitch_type = pitch.get('TaggedPitchType', 'Other')
-                color = get_pitch_color(pitch_type) if pd.notna(pitch_type) else '#95a5a6'
-                x, y, z = trajectory_9p_quadratic(pitch)
-                if x is not None:
-                    ax1.plot(y, z, color=color, linewidth=3, alpha=0.9)
-                    ball_indices = np.linspace(0, len(y) - 1, 6).astype(int)
-                    for bi in ball_indices:
-                        ax1.scatter(y[bi], z[bi], s=80, color='white',
-                                   edgecolors=color, linewidth=2, alpha=0.9, zorder=5)
-
-            ax1.set_xlim(-5, 55)
-            ax1.set_ylim(-0.5, 7.5)
-            ax1.set_xlabel('Distance from Plate (ft)', color='white')
-            ax1.set_ylabel('Height (ft)', color='white')
-            ax1.tick_params(colors='white')
-            ax1.grid(True, alpha=0.15, color='white')
-            ax1.invert_xaxis()
-
-            # Catcher's view
-            ax2 = fig.add_axes([0.05, 0.08, 0.45, 0.35])
-            ax2.set_facecolor('#1a1a2e')
-            ax2.set_title("Catcher's View", fontsize=11, fontweight='bold', color='white')
-
-            draw_strike_zone_pdf(ax2)
-
-            for idx, (_, pitch) in enumerate(ab_df.iterrows(), 1):
-                pitch_type = pitch.get('TaggedPitchType', 'Other')
-                color = get_pitch_color(pitch_type) if pd.notna(pitch_type) else '#95a5a6'
-
+            for i, (_, pitch) in enumerate(ab_df.iterrows(), 1):
                 x = pitch.get('PlateLocSide', 0)
                 z = pitch.get('PlateLocHeight', 2.5)
+                if pd.isna(x) or pd.isna(z):
+                    continue
+                color = get_pitch_color(pitch.get('TaggedPitchType', 'Other'))
+                ax1.scatter(x, z, c=color, s=100, edgecolors='black', linewidth=1, zorder=5)
+                ax1.annotate(str(i), (x, z), ha='center', va='center',
+                           fontsize=8, fontweight='bold', color='white')
+            ax1.grid(True, alpha=0.2)
 
-                if pd.notna(x) and pd.notna(z):
-                    ax2.scatter(x, z, c=color, s=200, alpha=0.8,
-                               edgecolors='white', linewidths=2, zorder=5)
-                    ax2.text(x, z, str(idx), ha='center', va='center',
-                            fontsize=10, fontweight='bold', color='white', zorder=6)
+            ax2 = plt.subplot(1, 2, 2)
+            ax2.axis('off')
 
-            ax2.set_xlim(-2.5, 2.5)
-            ax2.set_ylim(0, 5)
-            ax2.tick_params(colors='white')
+            pitch_text = "PITCH SEQUENCE\n" + "=" * 40 + "\n\n"
+            for i, (_, pitch) in enumerate(ab_df.iterrows(), 1):
+                pt = pitch.get('TaggedPitchType', 'Unknown')
+                velo = pitch.get('RelSpeed', 0)
+                call = pitch.get('PitchCall', 'Unknown')
+                pitch_text += f"{i}. {pt} - {velo:.0f} mph\n   Result: {call}\n\n"
 
-            # Pitch table
-            ax3 = fig.add_axes([0.55, 0.08, 0.4, 0.35])
-            ax3.axis('off')
+            final_result = ab_df.iloc[-1].get('PlayResult', 'Unknown')
+            pitch_text += f"\nFINAL RESULT: {final_result}"
 
-            columns = ['#', 'Type', 'Velo', 'Call', 'EV', 'LA']
-            table_data = []
-            for idx, (_, pitch) in enumerate(ab_df.iterrows(), 1):
-                pt = str(pitch.get('TaggedPitchType', '-'))[:8] if pd.notna(pitch.get('TaggedPitchType')) else '-'
-                velo = f"{pitch['RelSpeed']:.0f}" if pd.notna(pitch.get('RelSpeed')) else '-'
-                call = str(pitch.get('PitchCall', '-'))[:10] if pd.notna(pitch.get('PitchCall')) else '-'
-                ev = f"{pitch['ExitSpeed']:.0f}" if pd.notna(pitch.get('ExitSpeed')) else '-'
-                la = f"{pitch['Angle']:.0f}" if pd.notna(pitch.get('Angle')) else '-'
-                table_data.append([str(idx), pt, velo, call, ev, la])
+            ax2.text(0.1, 0.95, pitch_text, transform=ax2.transAxes,
+                    fontsize=10, verticalalignment='top', family='monospace')
 
-            if table_data:
-                table = ax3.table(cellText=table_data, colLabels=columns,
-                                 cellLoc='center', loc='upper center',
-                                 colWidths=[0.08, 0.22, 0.14, 0.26, 0.14, 0.14])
-                table.auto_set_font_size(False)
-                table.set_fontsize(9)
-                table.scale(1, 1.8)
-
-                for j in range(len(columns)):
-                    cell = table[(0, j)]
-                    cell.set_facecolor('#3d3d5c')
-                    cell.set_text_props(color='white', fontweight='bold')
-
-                for i, row in enumerate(table_data):
-                    pitch_type = row[1]
-                    color = get_pitch_color(pitch_type)
-                    for j in range(len(columns)):
-                        cell = table[(i + 1, j)]
-                        cell.set_facecolor('#2d2d44')
-                        cell.set_text_props(color='white')
-                        if j == 1:
-                            cell.set_facecolor(color)
-
-            pdf.savefig(fig, facecolor='#1a1a2e')
-            plt.close(fig)
+            plt.tight_layout()
+            pdf.savefig(fig)
+            plt.close()
 
     return output_path
 
 
 # =============================================================================
-# STREAMLIT UI
+# MAIN APP
 # =============================================================================
 def main():
     st.title("⚾ Baseball Analytics Dashboard")
-    st.markdown("*Unified interface for hitting and pitching analytics*")
+    st.markdown("---")
 
-    # Sidebar - Data Upload
+    # Sidebar - Data Loading Options
     st.sidebar.header("📁 Data Source")
 
-    uploaded_files = st.sidebar.file_uploader(
-        "Upload TrackMan CSV files",
-        type=['csv'],
-        accept_multiple_files=True,
-        help="Upload one or more TrackMan CSV files"
+    data_source = st.sidebar.radio(
+        "Choose data source:",
+        ["Upload Files", "Load from Folder"]
     )
 
-    if not uploaded_files:
-        st.info("👆 Upload TrackMan CSV files using the sidebar to get started.")
+    df = None
 
-        st.markdown("---")
-        st.markdown("### Available Reports")
+    if data_source == "Upload Files":
+        uploaded_files = st.sidebar.file_uploader(
+            "Upload CSV files",
+            type=['csv'],
+            accept_multiple_files=True
+        )
 
-        col1, col2 = st.columns(2)
+        if uploaded_files:
+            df = load_csv_files(uploaded_files)
 
-        with col1:
-            st.markdown("#### 🏏 Hitting Reports")
-            st.markdown("""
-            - **Team Offense Overview** - Spray chart of hard-hit balls
-            - **Hard-Hit Balls List** - CSV export of quality contact
-            - **Hitter Scrimmage Report** - Individual batter analysis
-            """)
+    else:  # Load from Folder
+        folder_path = st.sidebar.text_input(
+            "Folder Path",
+            placeholder="/path/to/your/csv/folder"
+        )
 
-        with col2:
-            st.markdown("#### ⚾ Pitching Reports")
-            st.markdown("""
-            - **Pitcher Graphic** - RHH/LHH splits, catcher view
-            - **Pitcher Scrimmage Report** - Detailed pitch analysis
-            - **At-Bat Sequences (PDF)** - Each at-bat breakdown
-            """)
+        if folder_path:
+            # Date range selector
+            st.sidebar.subheader("📅 Date Range")
 
+            use_date_filter = st.sidebar.checkbox("Filter by date range")
+
+            start_date = None
+            end_date = None
+
+            if use_date_filter:
+                col1, col2 = st.sidebar.columns(2)
+                with col1:
+                    start_date = st.date_input("Start Date", value=datetime.now() - timedelta(days=30))
+                    start_date = datetime.combine(start_date, datetime.min.time())
+                with col2:
+                    end_date = st.date_input("End Date", value=datetime.now())
+                    end_date = datetime.combine(end_date, datetime.max.time())
+
+            if st.sidebar.button("Load Data"):
+                with st.spinner("Loading data..."):
+                    df = load_csv_from_folder(folder_path, start_date, end_date)
+                    if df is not None:
+                        st.session_state['df'] = df
+                        st.success(f"Loaded {len(df)} rows from folder")
+
+            # Check if data was previously loaded
+            if 'df' in st.session_state:
+                df = st.session_state['df']
+
+    if df is None:
+        st.info("👈 Please upload CSV files or specify a folder path in the sidebar to get started.")
+
+        st.markdown("""
+        ### Welcome to the Baseball Analytics Dashboard!
+        
+        This dashboard provides several analysis tools:
+        
+        - **🎯 Pitcher Trajectory Report** - Side view and catcher view with KDE zones, split by RHH/LHH
+        - **🏏 Team Offense Overview** - Spray chart with exit velocity visualization
+        - **📋 Hard-Hit Balls List** - CSV export of quality contact
+        - **👤 Hitter Scrimmage Report** - Individual hitter analysis
+        - **📊 Pitcher Scrimmage Report** - Individual pitcher analysis
+        - **📄 At-Bat Sequences** - PDF export of pitch sequences
+        
+        ### Data Loading Options:
+        
+        **Upload Files**: Upload individual CSV files directly
+        
+        **Load from Folder**: Point to a folder containing your CSV files. Files should be named with dates in YYYYMMDD format (e.g., `20251003_game.csv`). You can filter by date range.
+        """)
         return
 
-    # Load data
-    df = load_csv_files(uploaded_files)
-
-    if df is None or len(df) == 0:
-        st.error("No valid data found in uploaded files.")
-        return
-
+    # Data Summary
     summary = get_data_summary(df)
 
-    # Sidebar - Data Summary
-    st.sidebar.success(f"✓ Loaded {summary['total_pitches']} pitches")
+    st.sidebar.markdown("---")
+    st.sidebar.header("📈 Data Summary")
+    st.sidebar.caption(f"📊 Total Pitches: {summary['total_pitches']}")
     st.sidebar.caption(f"📅 Dates: {', '.join([str(d) for d in summary['dates'][:3]])}")
     st.sidebar.caption(f"⚾ Pitchers: {len(summary['pitchers'])}")
     st.sidebar.caption(f"🏏 Batters: {len(summary['batters'])}")
     st.sidebar.caption(f"📊 Balls in Play: {summary['balls_in_play']}")
 
-    # Sidebar - Report Selection
+    # Report Selection
     st.sidebar.header("📊 Report Type")
 
     report_type = st.sidebar.selectbox(
         "Select Report",
         [
+            "🎯 Pitcher Trajectory Report (RHH/LHH)",
             "🏏 Team Offense Overview (Spray Chart)",
             "📋 Hard-Hit Balls List (CSV)",
             "👤 Hitter Scrimmage Report",
-            "⚾ Pitcher Graphic (RHH/LHH)",
             "📊 Pitcher Scrimmage Report",
             "📄 At-Bat Sequences (PDF)"
         ]
@@ -1101,9 +1480,41 @@ def main():
     st.markdown("---")
 
     # ==========================================================================
-    # TEAM OFFENSE OVERVIEW (SPRAY CHART)
+    # PITCHER TRAJECTORY REPORT (NEW - from pitch_count.py)
     # ==========================================================================
-    if report_type == "🏏 Team Offense Overview (Spray Chart)":
+    if report_type == "🎯 Pitcher Trajectory Report (RHH/LHH)":
+        st.header("🎯 Pitcher Trajectory Report")
+        st.caption("Side view trajectories and catcher's view with KDE zones")
+
+        pitchers = summary['pitchers']
+
+        if not pitchers:
+            st.warning("No pitchers found in data.")
+        else:
+            selected_pitcher = st.selectbox("Select Pitcher", pitchers)
+
+            with st.spinner("Generating trajectory report..."):
+                fig = create_pitcher_trajectory_report(df, selected_pitcher)
+
+            if fig is None:
+                st.warning(f"No trajectory data found for {selected_pitcher}. Make sure the data includes trajectory columns (x0, z0, vx0, etc.)")
+            else:
+                st.pyplot(fig)
+                plt.close()
+
+                buf = io.BytesIO()
+                fig = create_pitcher_trajectory_report(df, selected_pitcher)
+                fig.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='#1a1a2e')
+                buf.seek(0)
+                st.download_button("📥 Download PNG", buf,
+                                 file_name=f"pitcher_trajectory_{selected_pitcher.replace(', ', '_')}.png",
+                                 mime="image/png")
+                plt.close()
+
+    # ==========================================================================
+    # TEAM OFFENSE OVERVIEW (SPRAY CHART) - FIXED
+    # ==========================================================================
+    elif report_type == "🏏 Team Offense Overview (Spray Chart)":
         st.header("🏏 Team Offense Overview")
 
         col1, col2 = st.columns([1, 3])
@@ -1121,14 +1532,23 @@ def main():
                 if 'Distance' in bip_df.columns and bip_df['Distance'].notna().sum() > 0:
                     st.metric("Avg Distance", f"{bip_df['Distance'].mean():.0f} ft")
 
+                # Show breakdown by EV range - FIXED
+                st.markdown("**By Exit Velocity:**")
+                ev_low = len(bip_df[(bip_df['ExitSpeed'] >= min_ev) & (bip_df['ExitSpeed'] < 95)])
+                ev_mid = len(bip_df[(bip_df['ExitSpeed'] >= 95) & (bip_df['ExitSpeed'] < 100)])
+                ev_high = len(bip_df[bip_df['ExitSpeed'] >= 100])
+                st.caption(f"{min_ev}-95 mph: {ev_low}")
+                st.caption(f"95-100 mph: {ev_mid}")
+                st.caption(f"100+ mph: {ev_high}")
+
         with col2:
             if len(bip_df) > 0:
-                fig = create_team_spray_chart(bip_df, title=f"Team Offense Overview (EV ≥ {min_ev} mph)")
+                fig = create_team_spray_chart(bip_df, title=f"Team Offense Overview (EV ≥ {min_ev} mph)", min_ev=min_ev)
                 st.pyplot(fig)
                 plt.close()
 
                 buf = io.BytesIO()
-                fig = create_team_spray_chart(bip_df, title=f"Team Offense Overview (EV ≥ {min_ev} mph)")
+                fig = create_team_spray_chart(bip_df, title=f"Team Offense Overview (EV ≥ {min_ev} mph)", min_ev=min_ev)
                 fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
                 buf.seek(0)
                 st.download_button("📥 Download PNG", buf, file_name="team_offense_spray.png", mime="image/png")
@@ -1152,7 +1572,6 @@ def main():
         else:
             st.success(f"Found {len(csv_df)} hard-hit balls")
 
-            # Summary by player
             st.subheader("Summary by Player")
             summary_df = csv_df.groupby('Player').agg({
                 'Exit_Velocity': ['count', 'max', 'mean']
@@ -1203,36 +1622,6 @@ def main():
                 plt.close()
 
     # ==========================================================================
-    # PITCHER GRAPHIC (RHH/LHH)
-    # ==========================================================================
-    elif report_type == "⚾ Pitcher Graphic (RHH/LHH)":
-        st.header("⚾ Pitcher Graphic")
-
-        pitchers = summary['pitchers']
-
-        if not pitchers:
-            st.warning("No pitchers found in data.")
-        else:
-            selected_pitcher = st.selectbox("Select Pitcher", pitchers)
-
-            fig = create_pitcher_graphic(df, selected_pitcher)
-
-            if fig is None:
-                st.warning(f"No data found for {selected_pitcher}")
-            else:
-                st.pyplot(fig)
-                plt.close()
-
-                buf = io.BytesIO()
-                fig = create_pitcher_graphic(df, selected_pitcher)
-                fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-                buf.seek(0)
-                st.download_button("📥 Download PNG", buf,
-                                 file_name=f"pitcher_{selected_pitcher.replace(', ', '_')}.png",
-                                 mime="image/png")
-                plt.close()
-
-    # ==========================================================================
     # PITCHER SCRIMMAGE REPORT
     # ==========================================================================
     elif report_type == "📊 Pitcher Scrimmage Report":
@@ -1272,7 +1661,7 @@ def main():
     elif report_type == "📄 At-Bat Sequences (PDF)":
         st.header("📄 At-Bat Pitch Sequence Report")
 
-        st.info("This generates a PDF with each at-bat on a separate page, showing side view trajectories, catcher's view, and pitch data.")
+        st.info("This generates a PDF with each at-bat on a separate page, showing catcher's view and pitch data.")
 
         if st.button("🚀 Generate PDF Report"):
             with st.spinner("Generating PDF... This may take a minute."):
