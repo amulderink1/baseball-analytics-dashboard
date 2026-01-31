@@ -9,6 +9,7 @@ Reports included:
 - Hard-Hit Balls Report (CSV)
 - Pitcher Scrimmage Report
 - Hitter Scrimmage Report
+- Foul Ball Zone Report (per-batter foul ball analysis in zone/shadow)
 
 Run with: streamlit run main.py
 """
@@ -67,6 +68,13 @@ STRIKE_ZONE_WIDTH = PLATE_WIDTH
 STRIKE_ZONE_HEIGHT_LOW = 1.5
 STRIKE_ZONE_HEIGHT_HIGH = 3.5
 GRAVITY = 32.174
+
+# Foul Ball Zone Report Constants
+ZONE_LEFT = -0.83
+ZONE_RIGHT = 0.83
+ZONE_BOTTOM = 1.5  # matches STRIKE_ZONE_HEIGHT_LOW
+ZONE_TOP = 3.5     # matches STRIKE_ZONE_HEIGHT_HIGH
+SHADOW_BUFFER = 0.25
 
 # UMBA Physics Model Constants
 RHO_AIR = 0.074
@@ -1367,6 +1375,162 @@ def create_at_bat_pdf(df, output_path):
 
 
 # =============================================================================
+# FOUL BALL ZONE REPORT
+# =============================================================================
+def get_zone_status(row):
+    """Determine if pitch is in zone, shadow zone, or outside."""
+    side = row['PlateLocSide']
+    height = row['PlateLocHeight']
+
+    in_zone = (ZONE_LEFT <= side <= ZONE_RIGHT and
+               ZONE_BOTTOM <= height <= ZONE_TOP)
+
+    if in_zone:
+        return 'zone'
+
+    in_shadow = (ZONE_LEFT - SHADOW_BUFFER <= side <= ZONE_RIGHT + SHADOW_BUFFER and
+                 ZONE_BOTTOM - SHADOW_BUFFER <= height <= ZONE_TOP + SHADOW_BUFFER)
+
+    if in_shadow:
+        return 'shadow'
+
+    return 'outside'
+
+
+def create_foul_ball_zone_report(df, batter_name):
+    """Create the foul ball strike zone visualization for a specific batter.
+
+    Returns:
+        tuple: (matplotlib figure, stats dict) or (None, None) if no data
+    """
+    # Filter for this batter's foul balls
+    batter_df = df[df['Batter'] == batter_name].copy()
+    df_fouls = batter_df[batter_df['PitchCall'].str.contains('Foul', case=False, na=False)].copy()
+
+    if len(df_fouls) == 0:
+        return None, None
+
+    # Apply zone status
+    df_fouls['zone_status'] = df_fouls.apply(get_zone_status, axis=1)
+    df_plot = df_fouls[df_fouls['zone_status'].isin(['zone', 'shadow'])]
+
+    zone_count = len(df_plot[df_plot['zone_status'] == 'zone'])
+    shadow_count = len(df_plot[df_plot['zone_status'] == 'shadow'])
+    total_fouls = len(df_fouls)
+
+    # Get date range
+    date_range = None
+    if 'Date' in df_fouls.columns:
+        dates = pd.to_datetime(df_fouls['Date'], errors='coerce')
+        date_min = dates.min()
+        date_max = dates.max()
+        if pd.notna(date_min) and pd.notna(date_max):
+            date_min_str = date_min.strftime('%Y-%m-%d')
+            date_max_str = date_max.strftime('%Y-%m-%d')
+            if date_min_str == date_max_str:
+                date_range = date_min_str
+            else:
+                date_range = f"{date_min_str} to {date_max_str}"
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 10))
+
+    # Set tighter bounds
+    padding = 0.6
+    ax.set_xlim(ZONE_LEFT - padding, ZONE_RIGHT + padding)
+    ax.set_ylim(ZONE_BOTTOM - padding, ZONE_TOP + padding)
+
+    # Draw shadow zone
+    shadow_rect = Rectangle(
+        (ZONE_LEFT - SHADOW_BUFFER, ZONE_BOTTOM - SHADOW_BUFFER),
+        (ZONE_RIGHT - ZONE_LEFT) + 2 * SHADOW_BUFFER,
+        (ZONE_TOP - ZONE_BOTTOM) + 2 * SHADOW_BUFFER,
+        fill=True, facecolor='#f0f0f0', edgecolor='#cccccc',
+        linewidth=1.5, linestyle='--', zorder=1
+    )
+    ax.add_patch(shadow_rect)
+
+    # Draw strike zone
+    zone_rect = Rectangle(
+        (ZONE_LEFT, ZONE_BOTTOM),
+        ZONE_RIGHT - ZONE_LEFT,
+        ZONE_TOP - ZONE_BOTTOM,
+        fill=True, facecolor='white', edgecolor='black', linewidth=2.5, zorder=2
+    )
+    ax.add_patch(zone_rect)
+
+    # Draw zone grid (3x3)
+    zone_width = (ZONE_RIGHT - ZONE_LEFT) / 3
+    zone_height = (ZONE_TOP - ZONE_BOTTOM) / 3
+    for i in range(1, 3):
+        ax.plot([ZONE_LEFT + i * zone_width, ZONE_LEFT + i * zone_width],
+                [ZONE_BOTTOM, ZONE_TOP], color='gray', linestyle='-', alpha=0.4, linewidth=1, zorder=3)
+        ax.plot([ZONE_LEFT, ZONE_RIGHT],
+                [ZONE_BOTTOM + i * zone_height, ZONE_BOTTOM + i * zone_height],
+                color='gray', linestyle='-', alpha=0.4, linewidth=1, zorder=3)
+
+    # Plot pitches
+    for _, row in df_plot.iterrows():
+        color = get_pitch_color(row['TaggedPitchType'])
+        is_in_zone = row['zone_status'] == 'zone'
+
+        if is_in_zone:
+            # Filled circle for in-zone
+            ax.scatter(row['PlateLocSide'], row['PlateLocHeight'],
+                       c=color, s=200, marker='o', edgecolors='black',
+                       linewidths=1.5, alpha=0.9, zorder=5)
+        else:
+            # Hollow circle for shadow zone
+            ax.scatter(row['PlateLocSide'], row['PlateLocHeight'],
+                       facecolors='none', edgecolors=color, s=200, marker='o',
+                       linewidths=2.5, alpha=0.8, zorder=4)
+
+    # Labels
+    ax.set_xlabel('Horizontal Location (ft)\n← Inside (RHH) | Outside (RHH) →', fontsize=11)
+    ax.set_ylabel('Vertical Location (ft)', fontsize=11)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3, zorder=0)
+
+    # Title with batter name prominently displayed
+    title = f"{batter_name}\nFoul Balls in Zone & Shadow"
+    if date_range:
+        title = f"{batter_name}\n{date_range}\nFoul Balls in Zone & Shadow"
+
+    subtitle = f"● In Zone: {zone_count}  |  ○ Shadow: {shadow_count}  |  Total Fouls: {total_fouls}"
+    ax.set_title(f"{title}\n{subtitle}", fontsize=14, fontweight='bold', pad=15)
+
+    # Legend
+    pitch_types_in_data = df_plot['TaggedPitchType'].dropna().unique()
+    legend_patches = []
+    for pt in sorted(pitch_types_in_data):
+        color = get_pitch_color(pt)
+        patch = patches.Patch(color=color, label=pt)
+        legend_patches.append(patch)
+
+    if legend_patches:
+        ax.legend(handles=legend_patches, loc='upper right', fontsize=10,
+                  frameon=True, fancybox=True, shadow=True)
+
+    # Add pitch type breakdown as text
+    if len(df_plot) > 0:
+        breakdown = df_plot['TaggedPitchType'].value_counts()
+        breakdown_text = "Pitch Breakdown:\n" + "\n".join([f"  {pt}: {ct}" for pt, ct in breakdown.items()])
+        ax.text(0.02, 0.98, breakdown_text, transform=ax.transAxes, fontsize=9,
+                verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    plt.tight_layout()
+
+    stats = {
+        'in_zone': zone_count,
+        'shadow': shadow_count,
+        'total': total_fouls
+    }
+
+    return fig, stats
+
+
+# =============================================================================
 # HELPER: Get common cloud sync folder paths
 # =============================================================================
 def get_common_sync_paths():
@@ -1381,7 +1545,26 @@ def get_common_sync_paths():
         if gdrive_path.exists():
             for folder in gdrive_path.iterdir():
                 if folder.name.startswith("GoogleDrive"):
-                    paths.append(("Google Drive", str(folder / "My Drive")))
+                    # Add My Drive
+                    my_drive = folder / "My Drive"
+                    if my_drive.exists():
+                        paths.append(("Google Drive - My Drive", str(my_drive)))
+
+                    # Add Shared drives
+                    shared_drives = folder / "Shared drives"
+                    if shared_drives.exists():
+                        for shared in shared_drives.iterdir():
+                            if shared.is_dir():
+                                paths.append((f"Google Drive - {shared.name}", str(shared)))
+
+                    # Add shortcut folders (shared folders accessed via shortcuts)
+                    shortcuts_path = folder / ".shortcut-targets-by-id"
+                    if shortcuts_path.exists():
+                        for shortcut_id in shortcuts_path.iterdir():
+                            if shortcut_id.is_dir():
+                                for subfolder in shortcut_id.iterdir():
+                                    if subfolder.is_dir():
+                                        paths.append((f"Google Drive - {subfolder.name}", str(subfolder)))
 
         # Dropbox
         dropbox_path = home / "Dropbox"
@@ -1669,7 +1852,8 @@ def main():
             "📋 Hard-Hit Balls List (CSV)",
             "👤 Hitter Scrimmage Report",
             "📊 Pitcher Scrimmage Report",
-            "📄 At-Bat Sequences (PDF)"
+            "📄 At-Bat Sequences (PDF)",
+            "⚾ Foul Ball Zone Report"
         ]
     )
 
@@ -1876,6 +2060,49 @@ def main():
                         os.unlink(output_path)
                     else:
                         st.error("Failed to generate PDF. Check your data format.")
+
+    # ==========================================================================
+    # FOUL BALL ZONE REPORT
+    # ==========================================================================
+    elif report_type == "⚾ Foul Ball Zone Report":
+        st.header("⚾ Foul Ball Zone Report")
+        st.caption("Visualize foul ball locations in the strike zone and shadow zone")
+
+        batters = summary['batters']
+
+        if not batters:
+            st.warning("No batters found in data.")
+        else:
+            selected_batter = st.selectbox("Select Batter", batters)
+
+            if st.button("🔄 Generate Report", type="primary"):
+                with st.spinner("Generating foul ball zone report..."):
+                    fig, stats = create_foul_ball_zone_report(df, selected_batter)
+
+                if fig is None:
+                    st.warning(f"No foul ball data found for {selected_batter}")
+                else:
+                    st.pyplot(fig)
+                    plt.close()
+
+                    # Display stats
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("In-Zone Fouls", stats['in_zone'])
+                    with col2:
+                        st.metric("Shadow Zone Fouls", stats['shadow'])
+                    with col3:
+                        st.metric("Total Fouls", stats['total'])
+
+                    # Download button
+                    buf = io.BytesIO()
+                    fig, _ = create_foul_ball_zone_report(df, selected_batter)
+                    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='white')
+                    buf.seek(0)
+                    st.download_button("📥 Download PNG", buf,
+                                     file_name=f"foul_ball_zone_{selected_batter.replace(', ', '_')}.png",
+                                     mime="image/png")
+                    plt.close()
 
 
 if __name__ == "__main__":
