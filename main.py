@@ -229,19 +229,31 @@ def filter_quality_bip(df, team=None, min_ev=90, exclude_team='WES_VAL'):
 
     bip = df[mask].copy()
 
-    # Create EVCategory with fixed labels that match the color dictionary
-    # Always use standard labels regardless of min_ev threshold
-    bip['EVCategory'] = pd.cut(
-        bip['ExitSpeed'],
-        bins=[min_ev, 95, 100, float('inf')],
-        labels=['Low', 'Mid', 'High'],  # Use generic labels
-        right=False
-    )
-
-    # Create display labels that include actual ranges
-    bip['EVDisplay'] = bip['ExitSpeed'].apply(
-        lambda x: f'{min_ev}-95' if x < 95 else ('95-100' if x < 100 else '100+')
-    )
+    # Create EVCategory with dynamic bins based on min_ev
+    # Handle cases where min_ev >= 95 or min_ev >= 100
+    if min_ev >= 100:
+        bip['EVCategory'] = 'High'
+        bip['EVDisplay'] = '100+'
+    elif min_ev >= 95:
+        bip['EVCategory'] = pd.cut(
+            bip['ExitSpeed'],
+            bins=[min_ev, 100, float('inf')],
+            labels=['Mid', 'High'],
+            right=False
+        )
+        bip['EVDisplay'] = bip['ExitSpeed'].apply(
+            lambda x: f'{min_ev}-100' if x < 100 else '100+'
+        )
+    else:
+        bip['EVCategory'] = pd.cut(
+            bip['ExitSpeed'],
+            bins=[min_ev, 95, 100, float('inf')],
+            labels=['Low', 'Mid', 'High'],
+            right=False
+        )
+        bip['EVDisplay'] = bip['ExitSpeed'].apply(
+            lambda x: f'{min_ev}-95' if x < 95 else ('95-100' if x < 100 else '100+')
+        )
 
     return bip
 
@@ -331,10 +343,19 @@ def create_team_spray_chart(bip_df, title="Team Offense Overview", min_ev=90):
     ld_count = len(bip_df[bip_df['TaggedHitType'] == 'LineDrive'])
     fb_count = len(bip_df[bip_df['TaggedHitType'] == 'FlyBall'])
 
-    # Count by actual exit speed ranges - FIXED
-    ev_low_count = len(bip_df[(bip_df['ExitSpeed'] >= min_ev) & (bip_df['ExitSpeed'] < 95)])
-    ev_mid_count = len(bip_df[(bip_df['ExitSpeed'] >= 95) & (bip_df['ExitSpeed'] < 100)])
-    ev_high_count = len(bip_df[bip_df['ExitSpeed'] >= 100])
+    # Count by actual exit speed ranges - handles min_ev >= 95
+    if min_ev >= 100:
+        ev_low_count = 0
+        ev_mid_count = 0
+        ev_high_count = len(bip_df[bip_df['ExitSpeed'] >= 100])
+    elif min_ev >= 95:
+        ev_low_count = 0
+        ev_mid_count = len(bip_df[(bip_df['ExitSpeed'] >= min_ev) & (bip_df['ExitSpeed'] < 100)])
+        ev_high_count = len(bip_df[bip_df['ExitSpeed'] >= 100])
+    else:
+        ev_low_count = len(bip_df[(bip_df['ExitSpeed'] >= min_ev) & (bip_df['ExitSpeed'] < 95)])
+        ev_mid_count = len(bip_df[(bip_df['ExitSpeed'] >= 95) & (bip_df['ExitSpeed'] < 100)])
+        ev_high_count = len(bip_df[bip_df['ExitSpeed'] >= 100])
 
     fig.suptitle(title, fontsize=24, fontweight='bold', y=0.96)
     if date_str:
@@ -363,22 +384,40 @@ def create_team_spray_chart(bip_df, title="Team Offense Overview", min_ev=90):
         ax_spray.text(x, y - 0.02, f"{hit['ExitSpeed']:.1f}",
                       ha='center', va='top', fontsize=9, fontweight='bold')
 
-    # Stats box - FIXED to use actual counts
+    # Stats box - handles min_ev >= 95
     stats_text = f'Total: {total} | GB: {gb_count} | LD: {ld_count} | FB: {fb_count}\n'
-    stats_text += f'{min_ev}-95: {ev_low_count} | 95-100: {ev_mid_count} | 100+: {ev_high_count}'
+    if min_ev >= 100:
+        stats_text += f'100+: {ev_high_count}'
+    elif min_ev >= 95:
+        stats_text += f'{min_ev}-100: {ev_mid_count} | 100+: {ev_high_count}'
+    else:
+        stats_text += f'{min_ev}-95: {ev_low_count} | 95-100: {ev_mid_count} | 100+: {ev_high_count}'
     ax_spray.text(0.98, 0.98, stats_text, transform=ax_spray.transAxes,
                   ha='right', va='top', fontsize=12,
                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
 
-    # Legend - Updated with dynamic first range label
+    # Legend - Updated with dynamic labels based on min_ev
     ax_legend = fig.add_axes([0.1, 0.08, 0.8, 0.14])
     ax_legend.axis('off')
 
-    legend_data = [
-        ('Ground Ball', [f'{min_ev}-95', '95-100', '100+'], ['#93C5FD', '#3B82F6', '#1E40AF'], 0.05),
-        ('Line Drive', [f'{min_ev}-95', '95-100', '100+'], ['#86EFAC', '#22C55E', '#15803D'], 0.38),
-        ('Fly Ball', [f'{min_ev}-95', '95-100', '100+'], ['#FCD34D', '#F97316', '#DC2626'], 0.71),
-    ]
+    if min_ev >= 100:
+        legend_data = [
+            ('Ground Ball', ['100+'], ['#1E40AF'], 0.05),
+            ('Line Drive', ['100+'], ['#15803D'], 0.38),
+            ('Fly Ball', ['100+'], ['#DC2626'], 0.71),
+        ]
+    elif min_ev >= 95:
+        legend_data = [
+            ('Ground Ball', [f'{min_ev}-100', '100+'], ['#3B82F6', '#1E40AF'], 0.05),
+            ('Line Drive', [f'{min_ev}-100', '100+'], ['#22C55E', '#15803D'], 0.38),
+            ('Fly Ball', [f'{min_ev}-100', '100+'], ['#F97316', '#DC2626'], 0.71),
+        ]
+    else:
+        legend_data = [
+            ('Ground Ball', [f'{min_ev}-95', '95-100', '100+'], ['#93C5FD', '#3B82F6', '#1E40AF'], 0.05),
+            ('Line Drive', [f'{min_ev}-95', '95-100', '100+'], ['#86EFAC', '#22C55E', '#15803D'], 0.38),
+            ('Fly Ball', [f'{min_ev}-95', '95-100', '100+'], ['#FCD34D', '#F97316', '#DC2626'], 0.71),
+        ]
 
     for hit_type, labels, colors, x_start in legend_data:
         ax_legend.text(x_start, 0.8, hit_type, fontsize=14, fontweight='bold')
@@ -393,7 +432,12 @@ def create_team_spray_chart(bip_df, title="Team Offense Overview", min_ev=90):
     # Summary at bottom
     ax_summary = fig.add_axes([0.1, 0.01, 0.8, 0.04])
     ax_summary.axis('off')
-    summary_text = f'Total Quality BIP: {total}  |  {min_ev}-95 mph: {ev_low_count}  |  95-100 mph: {ev_mid_count}  |  100+ mph: {ev_high_count}'
+    if min_ev >= 100:
+        summary_text = f'Total Quality BIP: {total}  |  100+ mph: {ev_high_count}'
+    elif min_ev >= 95:
+        summary_text = f'Total Quality BIP: {total}  |  {min_ev}-100 mph: {ev_mid_count}  |  100+ mph: {ev_high_count}'
+    else:
+        summary_text = f'Total Quality BIP: {total}  |  {min_ev}-95 mph: {ev_low_count}  |  95-100 mph: {ev_mid_count}  |  100+ mph: {ev_high_count}'
     ax_summary.text(0.5, 0.5, summary_text, ha='center', va='center',
                     fontsize=13, fontweight='bold',
                     bbox=dict(boxstyle='round', facecolor='#f3f4f6', alpha=0.8))
@@ -1623,6 +1667,7 @@ def get_common_sync_paths():
 # =============================================================================
 def main():
     st.title("⚾ Baseball Analytics Dashboard")
+    st.caption("Trackman Data Analysis Tool")
     st.markdown("---")
 
     # Sidebar - Data Loading Options
@@ -1786,6 +1831,7 @@ def main():
         - **👤 Hitter Scrimmage Report** - Individual hitter analysis
         - **📊 Pitcher Scrimmage Report** - Individual pitcher analysis
         - **📄 At-Bat Sequences** - PDF export of pitch sequences
+        - **⚾ Foul Ball Zone Report** - Per-batter foul ball analysis in zone/shadow
         
         ---
         
@@ -1871,25 +1917,40 @@ def main():
         if not pitchers:
             st.warning("No pitchers found in data.")
         else:
-            selected_pitcher = st.selectbox("Select Pitcher", pitchers)
+            # Option to exclude certain pitchers
+            with st.expander("⚙️ Filter Pitchers", expanded=False):
+                excluded_pitchers = st.multiselect(
+                    "Exclude pitchers from list:",
+                    pitchers,
+                    default=[],
+                    help="Select pitchers you want to hide from the dropdown"
+                )
 
-            with st.spinner("Generating trajectory report..."):
-                fig = create_pitcher_trajectory_report(df, selected_pitcher)
+            # Filter the pitcher list
+            available_pitchers = [p for p in pitchers if p not in excluded_pitchers]
 
-            if fig is None:
-                st.warning(f"No trajectory data found for {selected_pitcher}. Make sure the data includes trajectory columns (x0, z0, vx0, etc.)")
+            if not available_pitchers:
+                st.warning("All pitchers have been excluded. Adjust the filter above.")
             else:
-                st.pyplot(fig)
-                plt.close()
+                selected_pitcher = st.selectbox("Select Pitcher", available_pitchers)
 
-                buf = io.BytesIO()
-                fig = create_pitcher_trajectory_report(df, selected_pitcher)
-                fig.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='#1a1a2e')
-                buf.seek(0)
-                st.download_button("📥 Download PNG", buf,
-                                 file_name=f"pitcher_trajectory_{selected_pitcher.replace(', ', '_')}.png",
-                                 mime="image/png")
-                plt.close()
+                with st.spinner("Generating trajectory report..."):
+                    fig = create_pitcher_trajectory_report(df, selected_pitcher)
+
+                if fig is None:
+                    st.warning(f"No trajectory data found for {selected_pitcher}. Make sure the data includes trajectory columns (x0, z0, vx0, etc.)")
+                else:
+                    st.pyplot(fig)
+                    plt.close()
+
+                    buf = io.BytesIO()
+                    fig = create_pitcher_trajectory_report(df, selected_pitcher)
+                    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='#1a1a2e')
+                    buf.seek(0)
+                    st.download_button("📥 Download PNG", buf,
+                                     file_name=f"pitcher_trajectory_{selected_pitcher.replace(', ', '_')}.png",
+                                     mime="image/png")
+                    plt.close()
 
     # ==========================================================================
     # TEAM OFFENSE OVERVIEW (SPRAY CHART) - FIXED
