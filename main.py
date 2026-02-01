@@ -31,8 +31,13 @@ import io
 import warnings
 import glob
 import re
-import tkinter as tk
-from tkinter import filedialog
+# tkinter for local folder picker (not available on Streamlit Cloud)
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+    TKINTER_AVAILABLE = True
+except ImportError:
+    TKINTER_AVAILABLE = False
 
 warnings.filterwarnings('ignore')
 
@@ -1666,6 +1671,8 @@ def get_common_sync_paths():
 
 def select_folder_dialog():
     """Open a native folder picker dialog and return the selected path."""
+    if not TKINTER_AVAILABLE:
+        return None
     root = tk.Tk()
     root.withdraw()  # Hide the main tkinter window
     root.attributes('-topmost', True)  # Bring dialog to front
@@ -1716,13 +1723,16 @@ def main():
         if 'selected_folder_path' not in st.session_state:
             st.session_state['selected_folder_path'] = ""
 
-        # Browse folder button
+        # Browse folder button (only available when running locally with tkinter)
         st.sidebar.markdown("**📂 Select Folder:**")
-        if st.sidebar.button("🔍 Browse for Folder...", key="browse_folder_btn", type="primary"):
-            selected = select_folder_dialog()
-            if selected:
-                st.session_state['selected_folder_path'] = selected
-                st.rerun()
+        if TKINTER_AVAILABLE:
+            if st.sidebar.button("🔍 Browse for Folder...", key="browse_folder_btn", type="primary"):
+                selected = select_folder_dialog()
+                if selected:
+                    st.session_state['selected_folder_path'] = selected
+                    st.rerun()
+        else:
+            st.sidebar.info("📤 Running on cloud - use **Upload Files** or enter path below")
 
         # Check for common cloud sync folders
         sync_paths = get_common_sync_paths()
