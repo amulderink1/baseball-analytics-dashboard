@@ -31,6 +31,8 @@ import io
 import warnings
 import glob
 import re
+import tkinter as tk
+from tkinter import filedialog
 
 warnings.filterwarnings('ignore')
 
@@ -1662,6 +1664,18 @@ def get_common_sync_paths():
     return paths
 
 
+def select_folder_dialog():
+    """Open a native folder picker dialog and return the selected path."""
+    root = tk.Tk()
+    root.withdraw()  # Hide the main tkinter window
+    root.attributes('-topmost', True)  # Bring dialog to front
+    folder_path = filedialog.askdirectory(
+        title="Select Folder Containing CSV Files"
+    )
+    root.destroy()
+    return folder_path if folder_path else None
+
+
 # =============================================================================
 # MAIN APP
 # =============================================================================
@@ -1698,11 +1712,23 @@ def main():
     # =========================================================================
     elif data_source == "Load from Folder":
 
+        # Initialize session state for selected folder
+        if 'selected_folder_path' not in st.session_state:
+            st.session_state['selected_folder_path'] = ""
+
+        # Browse folder button
+        st.sidebar.markdown("**📂 Select Folder:**")
+        if st.sidebar.button("🔍 Browse for Folder...", key="browse_folder_btn", type="primary"):
+            selected = select_folder_dialog()
+            if selected:
+                st.session_state['selected_folder_path'] = selected
+                st.rerun()
+
         # Check for common cloud sync folders
         sync_paths = get_common_sync_paths()
 
         if sync_paths:
-            st.sidebar.markdown("**☁️ Detected Cloud Folders:**")
+            st.sidebar.markdown("**☁️ Or Quick Select Cloud Folder:**")
             selected_sync = st.sidebar.selectbox(
                 "Quick select:",
                 ["Custom path..."] + [f"{name}: {path}" for name, path in sync_paths],
@@ -1712,29 +1738,46 @@ def main():
             if selected_sync != "Custom path...":
                 # Extract path from selection
                 folder_path = selected_sync.split(": ", 1)[1]
+            elif st.session_state['selected_folder_path']:
+                folder_path = st.session_state['selected_folder_path']
             else:
                 folder_path = st.sidebar.text_input(
-                    "Folder Path",
+                    "Or enter path manually:",
                     placeholder="/path/to/your/csv/folder",
                     key="custom_folder_path"
                 )
         else:
-            folder_path = st.sidebar.text_input(
-                "Folder Path",
-                placeholder="/path/to/your/csv/folder",
-                key="folder_path_input"
-            )
+            # Show the browsed folder path or allow manual input
+            if st.session_state['selected_folder_path']:
+                folder_path = st.session_state['selected_folder_path']
+                st.sidebar.text_input(
+                    "Selected Folder:",
+                    value=folder_path,
+                    disabled=True,
+                    key="display_folder_path"
+                )
+                if st.sidebar.button("✖️ Clear Selection", key="clear_folder"):
+                    st.session_state['selected_folder_path'] = ""
+                    st.rerun()
+            else:
+                folder_path = st.sidebar.text_input(
+                    "Or enter path manually:",
+                    placeholder="/path/to/your/csv/folder",
+                    key="folder_path_input"
+                )
 
             # Show helpful tips
             with st.sidebar.expander("💡 Tips: Finding your folder"):
                 st.markdown("""
+                **Recommended:** Use the **Browse for Folder** button above!
+
                 **Google Drive Desktop:**
                 - Mac: `~/Library/CloudStorage/GoogleDrive-.../My Drive`
                 - Windows: `G:\\My Drive` or `C:\\Users\\You\\Google Drive`
-                
+
                 **Dropbox:**
                 - Mac/Windows: `~/Dropbox` or `C:\\Users\\You\\Dropbox`
-                
+
                 **OneDrive:**
                 - Mac: `~/Library/CloudStorage/OneDrive-...`
                 - Windows: `C:\\Users\\You\\OneDrive`
