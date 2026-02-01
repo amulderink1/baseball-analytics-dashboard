@@ -202,8 +202,8 @@ def get_data_summary(df):
     summary = {
         'total_pitches': len(df),
         'dates': df['Date'].unique().tolist() if 'Date' in df.columns else [],
-        'pitchers': sorted(df[df['PitcherTeam'] != 'WES_VAL']['Pitcher'].dropna().unique().tolist()) if 'Pitcher' in df.columns else [],
-        'batters': sorted(df[df['BatterTeam'] != 'WES_VAL']['Batter'].dropna().unique().tolist()) if 'Batter' in df.columns else [],
+        'pitchers': sorted(df[df['PitcherTeam'] == 'SAN_BRO']['Pitcher'].dropna().unique().tolist()) if 'Pitcher' in df.columns else [],
+        'batters': sorted(df[df['BatterTeam'] == 'SAN_BRO']['Batter'].dropna().unique().tolist()) if 'Batter' in df.columns else [],
         'teams': sorted(df['BatterTeam'].dropna().unique().tolist()) if 'BatterTeam' in df.columns else [],
         'balls_in_play': len(df[df['PitchCall'] == 'InPlay']) if 'PitchCall' in df.columns else 0
     }
@@ -218,7 +218,7 @@ def get_pitch_color(pitch_type):
 # =============================================================================
 # HITTING REPORTS - FIXED VERSION
 # =============================================================================
-def filter_quality_bip(df, team=None, min_ev=90, exclude_team='WES_VAL'):
+def filter_quality_bip(df, team=None, min_ev=90, exclude_team=None):
     """Filter for quality balls in play - FIXED VERSION"""
     mask = (
         (df['ExitSpeed'].notna()) &
@@ -1689,7 +1689,6 @@ def select_folder_dialog():
 def main():
     st.title("⚾ Baseball Analytics Dashboard")
     st.caption("Trackman Data Analysis Tool")
-    st.markdown("---")
 
     # Sidebar - Data Loading Options
     st.sidebar.header("📁 Data Source")
@@ -2016,10 +2015,10 @@ def main():
         with col1:
             min_ev = st.slider("Min Exit Velocity", 85, 100, 90)
 
-            bip_df = filter_quality_bip(df, min_ev=min_ev)
+            bip_df = filter_quality_bip(df, team='SAN_BRO', min_ev=min_ev)
 
             if len(bip_df) == 0:
-                st.warning("No balls in play found matching criteria.")
+                st.warning("No balls in play found matching criteria for SAN_BRO.")
             else:
                 st.metric("Quality BIP", len(bip_df))
                 st.metric("Avg Exit Velo", f"{bip_df['ExitSpeed'].mean():.1f} mph")
@@ -2059,10 +2058,10 @@ def main():
         with col1:
             min_ev = st.selectbox("Exit Velocity Threshold", [90, 95, 100])
 
-        csv_df = create_hard_hit_csv(df, min_ev=min_ev)
+        csv_df = create_hard_hit_csv(df, team='SAN_BRO', min_ev=min_ev)
 
         if csv_df is None or len(csv_df) == 0:
-            st.warning(f"No balls found with exit velocity ≥ {min_ev} mph")
+            st.warning(f"No SAN_BRO balls found with exit velocity ≥ {min_ev} mph")
         else:
             st.success(f"Found {len(csv_df)} hard-hit balls")
 
