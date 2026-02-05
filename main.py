@@ -1448,45 +1448,8 @@ def get_zone_status(row):
     return 'outside'
 
 
-def create_foul_ball_zone_report(df, batter_name):
-    """Create the foul ball strike zone visualization for a specific batter.
-
-    Returns:
-        tuple: (matplotlib figure, stats dict) or (None, None) if no data
-    """
-    # Filter for this batter's foul balls
-    batter_df = df[df['Batter'] == batter_name].copy()
-    df_fouls = batter_df[batter_df['PitchCall'].str.contains('Foul', case=False, na=False)].copy()
-
-    if len(df_fouls) == 0:
-        return None, None
-
-    # Apply zone status
-    df_fouls['zone_status'] = df_fouls.apply(get_zone_status, axis=1)
-    df_plot = df_fouls[df_fouls['zone_status'].isin(['zone', 'shadow'])]
-
-    zone_count = len(df_plot[df_plot['zone_status'] == 'zone'])
-    shadow_count = len(df_plot[df_plot['zone_status'] == 'shadow'])
-    total_fouls = len(df_fouls)
-
-    # Get date range
-    date_range = None
-    if 'Date' in df_fouls.columns:
-        dates = pd.to_datetime(df_fouls['Date'], errors='coerce')
-        date_min = dates.min()
-        date_max = dates.max()
-        if pd.notna(date_min) and pd.notna(date_max):
-            date_min_str = date_min.strftime('%Y-%m-%d')
-            date_max_str = date_max.strftime('%Y-%m-%d')
-            if date_min_str == date_max_str:
-                date_range = date_min_str
-            else:
-                date_range = f"{date_min_str} to {date_max_str}"
-
-    # Create figure
-    fig, ax = plt.subplots(figsize=(10, 10))
-
-    # Set tighter bounds
+def draw_foul_strike_zone(ax, df_plot, title_text):
+    """Draw a single strike zone with foul ball data on the given axes."""
     padding = 0.6
     ax.set_xlim(ZONE_LEFT - padding, ZONE_RIGHT + padding)
     ax.set_ylim(ZONE_BOTTOM - padding, ZONE_TOP + padding)
@@ -1526,56 +1489,123 @@ def create_foul_ball_zone_report(df, batter_name):
         is_in_zone = row['zone_status'] == 'zone'
 
         if is_in_zone:
-            # Filled circle for in-zone
             ax.scatter(row['PlateLocSide'], row['PlateLocHeight'],
                        c=color, s=200, marker='o', edgecolors='black',
                        linewidths=1.5, alpha=0.9, zorder=5)
         else:
-            # Hollow circle for shadow zone
             ax.scatter(row['PlateLocSide'], row['PlateLocHeight'],
                        facecolors='none', edgecolors=color, s=200, marker='o',
                        linewidths=2.5, alpha=0.8, zorder=4)
 
     # Labels
-    ax.set_xlabel('Horizontal Location (ft)\n← Inside (RHH) | Outside (RHH) →', fontsize=11)
-    ax.set_ylabel('Vertical Location (ft)', fontsize=11)
+    ax.set_xlabel('Horizontal Location (ft)\n← Inside (RHH) | Outside (RHH) →', fontsize=10)
+    ax.set_ylabel('Vertical Location (ft)', fontsize=10)
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.3, zorder=0)
 
-    # Title with batter name prominently displayed
-    title = f"{batter_name}\nFoul Balls in Zone & Shadow"
-    if date_range:
-        title = f"{batter_name}\n{date_range}\nFoul Balls in Zone & Shadow"
+    # Count stats for this zone
+    zone_count = len(df_plot[df_plot['zone_status'] == 'zone'])
+    shadow_count = len(df_plot[df_plot['zone_status'] == 'shadow'])
 
-    subtitle = f"● In Zone: {zone_count}  |  ○ Shadow: {shadow_count}  |  Total Fouls: {total_fouls}"
-    ax.set_title(f"{title}\n{subtitle}", fontsize=14, fontweight='bold', pad=15)
-
-    # Legend
-    pitch_types_in_data = df_plot['TaggedPitchType'].dropna().unique()
-    legend_patches = []
-    for pt in sorted(pitch_types_in_data):
-        color = get_pitch_color(pt)
-        patch = patches.Patch(color=color, label=pt)
-        legend_patches.append(patch)
-
-    if legend_patches:
-        ax.legend(handles=legend_patches, loc='upper right', fontsize=10,
-                  frameon=True, fancybox=True, shadow=True)
+    subtitle = f"● Zone: {zone_count}  |  ○ Shadow: {shadow_count}"
+    ax.set_title(f"{title_text}\n{subtitle}", fontsize=12, fontweight='bold', pad=10)
 
     # Add pitch type breakdown as text
     if len(df_plot) > 0:
         breakdown = df_plot['TaggedPitchType'].value_counts()
         breakdown_text = "Pitch Breakdown:\n" + "\n".join([f"  {pt}: {ct}" for pt, ct in breakdown.items()])
-        ax.text(0.02, 0.98, breakdown_text, transform=ax.transAxes, fontsize=9,
+        ax.text(0.02, 0.98, breakdown_text, transform=ax.transAxes, fontsize=8,
                 verticalalignment='top', fontfamily='monospace',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-    plt.tight_layout()
+    return zone_count, shadow_count
+
+
+def create_foul_ball_zone_report(df, batter_name):
+    """Create the foul ball strike zone visualization for a specific batter.
+    Shows two side-by-side zones: 0-1 strikes and 2 strikes.
+
+    Returns:
+        tuple: (matplotlib figure, stats dict) or (None, None) if no data
+    """
+    # Filter for this batter's foul balls
+    batter_df = df[df['Batter'] == batter_name].copy()
+    df_fouls = batter_df[batter_df['PitchCall'].str.contains('Foul', case=False, na=False)].copy()
+
+    if len(df_fouls) == 0:
+        return None, None
+
+    # Apply zone status
+    df_fouls['zone_status'] = df_fouls.apply(get_zone_status, axis=1)
+    total_fouls = len(df_fouls)
+
+    # Split data by strike count
+    df_less_than_2 = df_fouls[df_fouls['Strikes'] < 2]
+    df_plot_less_than_2 = df_less_than_2[df_less_than_2['zone_status'].isin(['zone', 'shadow'])]
+
+    df_two_strikes = df_fouls[df_fouls['Strikes'] == 2]
+    df_plot_two_strikes = df_two_strikes[df_two_strikes['zone_status'].isin(['zone', 'shadow'])]
+
+    # Get date range
+    date_range = None
+    if 'Date' in df_fouls.columns:
+        dates = pd.to_datetime(df_fouls['Date'], errors='coerce')
+        date_min = dates.min()
+        date_max = dates.max()
+        if pd.notna(date_min) and pd.notna(date_max):
+            date_min_str = date_min.strftime('%Y-%m-%d')
+            date_max_str = date_max.strftime('%Y-%m-%d')
+            if date_min_str == date_max_str:
+                date_range = date_min_str
+            else:
+                date_range = f"{date_min_str} to {date_max_str}"
+
+    # Create figure with two subplots side by side
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(16, 9))
+
+    # Draw left zone (less than 2 strikes)
+    zone_count_left, shadow_count_left = draw_foul_strike_zone(
+        ax_left, df_plot_less_than_2, "0-1 Strikes"
+    )
+
+    # Draw right zone (2 strikes)
+    zone_count_right, shadow_count_right = draw_foul_strike_zone(
+        ax_right, df_plot_two_strikes, "2 Strikes"
+    )
+
+    # Create shared legend from all pitch types
+    all_pitch_types = set(df_plot_less_than_2['TaggedPitchType'].unique()) | set(df_plot_two_strikes['TaggedPitchType'].unique())
+    legend_patches = []
+    for pt in sorted(all_pitch_types):
+        color = get_pitch_color(pt)
+        patch = patches.Patch(color=color, label=pt)
+        legend_patches.append(patch)
+
+    if legend_patches:
+        fig.legend(handles=legend_patches, loc='lower center', ncol=len(legend_patches),
+                   fontsize=10, frameon=True, fancybox=True, shadow=True,
+                   bbox_to_anchor=(0.5, 0.02))
+
+    # Main title
+    title = f"{batter_name} - Foul Balls in Zone & Shadow"
+    if date_range:
+        title = f"{batter_name} - {date_range}\nFoul Balls in Zone & Shadow"
+
+    total_zone = zone_count_left + zone_count_right
+    total_shadow = shadow_count_left + shadow_count_right
+    subtitle = f"Total: ● Zone: {total_zone}  |  ○ Shadow: {total_shadow}  |  All Fouls: {total_fouls}"
+    fig.suptitle(f"{title}\n{subtitle}", fontsize=14, fontweight='bold', y=0.98)
+
+    plt.tight_layout(rect=[0, 0.08, 1, 0.92])
 
     stats = {
-        'in_zone': zone_count,
-        'shadow': shadow_count,
-        'total': total_fouls
+        'in_zone': total_zone,
+        'shadow': total_shadow,
+        'total': total_fouls,
+        'zone_0_1': zone_count_left,
+        'shadow_0_1': shadow_count_left,
+        'zone_2': zone_count_right,
+        'shadow_2': shadow_count_right
     }
 
     return fig, stats
@@ -2198,7 +2228,7 @@ def main():
                     st.pyplot(fig)
                     plt.close()
 
-                    # Display stats
+                    # Display stats - totals
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         st.metric("In-Zone Fouls", stats['in_zone'])
@@ -2206,6 +2236,18 @@ def main():
                         st.metric("Shadow Zone Fouls", stats['shadow'])
                     with col3:
                         st.metric("Total Fouls", stats['total'])
+
+                    # Display stats - by strike count
+                    st.divider()
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.caption("0-1 Strikes")
+                        st.metric("Zone", stats['zone_0_1'])
+                        st.metric("Shadow", stats['shadow_0_1'])
+                    with col_b:
+                        st.caption("2 Strikes")
+                        st.metric("Zone", stats['zone_2'])
+                        st.metric("Shadow", stats['shadow_2'])
 
                     # Download button
                     buf = io.BytesIO()
